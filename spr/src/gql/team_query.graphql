@@ -1,0 +1,10 @@
+query TeamQuery($org: String!, $slug: String!) {
+  organization(login: $org) {
+    team(slug: $slug) {
+      id
+      name
+      slug
+      description
+    }
+  }
+}

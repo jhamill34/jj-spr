@@ -1,0 +1,7 @@
+mutation CreatePullRequest($input: CreatePullRequestInput!) {
+  createPullRequest(input: $input) {
+    pullRequest {
+      number
+    }
+  }
+}

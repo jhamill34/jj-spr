@@ -11,6 +11,10 @@ use lazy_regex::regex;
 use crate::{
     config::{AuthTokenSource, get_auth_token_with_source, set_jj_config},
     error::{Error, Result, ResultExt},
+    github::{
+        GRAPHQL_ENDPOINT, RepositoryQuery, ViewerQuery, create_graphql_client, repository_query,
+        viewer_query,
+    },
     output::output,
 };
 
@@ -85,12 +89,19 @@ pub async fn init() -> Result<()> {
         pat
     };
 
-    let octocrab = octocrab::OctocrabBuilder::new()
-        .personal_token(pat.clone())
-        .build()?;
-    let github_user = octocrab.current().user().await?;
+    let client = create_graphql_client(&pat)?;
+    let response_body = graphql_client::reqwest::post_graphql::<ViewerQuery, _>(
+        &client,
+        "/graphql",
+        viewer_query::Variables {},
+    )
+    .await?;
+    let viewer = response_body
+        .data
+        .ok_or_else(|| Error::new("failed to fetch viewer"))?
+        .viewer;
 
-    output("👋", &formatdoc!("Hello {}!", github_user.login))?;
+    output("👋", &formatdoc!("Hello {}!", viewer.login))?;
 
     if !reuse_token {
         set_jj_config("spr.githubAuthToken", pat.as_str(), &path)?;
@@ -152,21 +163,35 @@ pub async fn init() -> Result<()> {
         .interact_text()?;
     set_jj_config("spr.githubRepository", &github_repo, &path)?;
 
-    // Master branch name (just query GitHub)
+    // Master branch name (query GitHub via GraphQL)
+    let (owner, name) = {
+        let mut parts = github_repo.splitn(2, '/');
+        let owner = parts.next().unwrap_or("");
+        let name = parts.next().unwrap_or("");
+        (owner, name)
+    };
+    let variables = repository_query::Variables {
+        owner: owner.to_string(),
+        name: name.to_string(),
+    };
 
-    let github_repo_info = octocrab
-        .get::<octocrab::models::Repository, _, _>(format!("repos/{}", &github_repo), None::<&()>)
-        .await?;
+    let response_body = graphql_client::reqwest::post_graphql::<RepositoryQuery, _>(
+        &client,
+        GRAPHQL_ENDPOINT,
+        variables,
+    )
+    .await?;
 
-    set_jj_config(
-        "spr.githubMasterBranch",
-        github_repo_info
-            .default_branch
-            .as_ref()
-            .map(|s| &s[..])
-            .unwrap_or("master"),
-        &path,
-    )?;
+    let default_branch = response_body
+        .data
+        .ok_or_else(|| Error::new("failed to fetch repository"))?
+        .repository
+        .ok_or_else(|| Error::new("failed to find repository"))?
+        .default_branch_ref
+        .map(|b| b.name)
+        .unwrap_or("master".to_string());
+
+    set_jj_config("spr.githubMasterBranch", &default_branch, &path)?;
 
     // Pull Request branch prefix
 
@@ -176,7 +201,7 @@ pub async fn init() -> Result<()> {
         .get_string("spr.branchPrefix")
         .ok()
         .and_then(|value| if value.is_empty() { None } else { Some(value) })
-        .unwrap_or_else(|| format!("spr/{}/", &github_user.login));
+        .unwrap_or_else(|| format!("spr/{}/", &viewer.login));
 
     output(
         "❓",

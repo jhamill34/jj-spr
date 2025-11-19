@@ -6,13 +6,17 @@
  */
 
 use graphql_client::{GraphQLQuery, Response};
+use reqwest::header;
 use serde::Deserialize;
 
 use crate::{
     error::{Error, Result, ResultExt},
+    github::create_pull_request::CreatePullRequestInput,
     message::{MessageSection, MessageSectionsMap, build_github_body, parse_message},
 };
 use std::collections::{HashMap, HashSet};
+
+pub const GRAPHQL_ENDPOINT: &str = "/graphql";
 
 #[derive(Clone)]
 pub struct GitHub {
@@ -105,6 +109,38 @@ pub struct PullRequestMergeability {
 #[derive(GraphQLQuery)]
 #[graphql(
     schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/viewer_query.graphql",
+    response_derives = "Debug"
+)]
+pub struct ViewerQuery;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/team_query.graphql",
+    response_derives = "Debug"
+)]
+pub struct TeamQuery;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/user_query.graphql",
+    response_derives = "Debug"
+)]
+pub struct UserQuery;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/repository_query.graphql",
+    response_derives = "Debug"
+)]
+pub struct RepositoryQuery;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
     query_path = "src/gql/pullrequest_query.graphql",
     response_derives = "Debug"
 )]
@@ -119,6 +155,49 @@ type GitObjectID = String;
 )]
 pub struct PullRequestMergeabilityQuery;
 
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/create_pull_request.graphql",
+    response_drives = "Debug"
+)]
+pub struct CreatePullRequest;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/request_reviewers.graphql",
+    response_drives = "Debug"
+)]
+pub struct RequestReviews;
+
+pub fn create_graphql_client(token: &str) -> Result<reqwest::Client> {
+    let mut headers = header::HeaderMap::new();
+    headers.insert(
+        header::ACCEPT,
+        "application/json"
+            .parse()
+            .map_err(|_| Error::new("failed to parse content type"))?,
+    );
+    headers.insert(
+        header::USER_AGENT,
+        format!("spr/{}", env!("CARGO_PKG_VERSION"))
+            .try_into()
+            .map_err(|_| Error::new("failed to parse user agent"))?,
+    );
+    headers.insert(
+        header::AUTHORIZATION,
+        format!("Bearer {}", token)
+            .parse()
+            .map_err(|_| Error::new("Failed to parse auth header"))?,
+    );
+
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .map_err(|_| Error::new("Failed build reqwest client"))
+}
+
 impl GitHub {
     pub fn new(config: crate::config::Config, graphql_client: reqwest::Client) -> Self {
         Self {
@@ -127,43 +206,64 @@ impl GitHub {
         }
     }
 
-    pub async fn get_github_user(login: String) -> Result<UserWithName> {
-        octocrab::instance()
-            .get::<UserWithName, _, _>(format!("users/{}", login), None::<&()>)
-            .await
-            .map_err(Error::from)
+    pub async fn post_graphql<Q: GraphQLQuery>(
+        &self,
+        variables: Q::Variables,
+    ) -> Result<Response<Q::ResponseData>> {
+        return graphql_client::reqwest::post_graphql::<Q, _>(
+            &self.graphql_client,
+            GRAPHQL_ENDPOINT,
+            variables,
+        )
+        .await
+        .map_err(|e| Error::new(format!("Failed to fetch graphql data: {}", e)));
+    }
+
+    pub async fn get_github_user(&self, login: String) -> Result<UserWithName> {
+        let variables = user_query::Variables {
+            login: login.clone(),
+        };
+
+        let response_body = self.post_graphql::<UserQuery>(variables).await?;
+        let user = response_body
+            .data
+            .ok_or_else(|| Error::new("Failed to fetch user"))?
+            .user
+            .ok_or_else(|| Error::new(format!("User '{}' not found", login)))?;
+
+        Ok(UserWithName {
+            login: user.login,
+            name: user.name,
+            is_collaborator: false, // Not available in GraphQL user query
+        })
     }
 
     pub async fn get_github_team(
+        &self,
         owner: String,
         team: String,
-    ) -> Result<octocrab::models::teams::Team> {
-        octocrab::instance()
-            .teams(owner)
-            .get(team)
-            .await
-            .map_err(Error::from)
+    ) -> Result<team_query::TeamQueryOrganizationTeam> {
+        let variables = team_query::Variables {
+            org: owner.clone(),
+            slug: team.clone(),
+        };
+
+        let response_body = self.post_graphql::<TeamQuery>(variables).await?;
+        let team = response_body
+            .data
+            .and_then(|d| d.organization)
+            .and_then(|org| org.team)
+            .ok_or_else(|| Error::new(format!("Team '{}/{}' not found", owner, team)))?;
+        Ok(team)
     }
 
     pub async fn get_pull_request(self, number: u64) -> Result<PullRequest> {
-        let GitHub {
-            config,
-            graphql_client,
-        } = self;
-
         let variables = pull_request_query::Variables {
-            name: config.repo.clone(),
-            owner: config.owner.clone(),
+            name: self.config.repo.clone(),
+            owner: self.config.owner.clone(),
             number: number as i64,
         };
-        let request_body = PullRequestQuery::build_query(variables);
-        let res = graphql_client
-            .post("https://api.github.com/graphql")
-            .json(&request_body)
-            .send()
-            .await?;
-        let response_body: Response<pull_request_query::ResponseData> = res.json().await?;
-
+        let response_body = self.post_graphql::<PullRequestQuery>(variables).await?;
         if let Some(errors) = response_body.errors {
             let error = Err(Error::new(format!("fetching PR #{number} failed")));
             return errors
@@ -179,15 +279,15 @@ impl GitHub {
             .pull_request
             .ok_or_else(|| Error::new("failed to find PR"))?;
 
-        let base = config.new_github_branch_from_ref(&pr.base_ref_name)?;
-        let head = config.new_github_branch_from_ref(&pr.head_ref_name)?;
+        let base = self.config.new_github_branch_from_ref(&pr.base_ref_name)?;
+        let head = self.config.new_github_branch_from_ref(&pr.head_ref_name)?;
 
         // Fetch refs from remote using git (since we're in a colocated repo)
         let _fetch_result = tokio::process::Command::new("git")
             .args([
                 "fetch",
                 "--no-write-fetch-head",
-                &config.remote_name,
+                &self.config.remote_name,
                 &format!("{}:{}", head.on_github(), head.local()),
                 &format!("{}:{}", base.on_github(), base.local()),
             ])
@@ -237,7 +337,10 @@ impl GitHub {
             },
         );
 
-        sections.insert(MessageSection::PullRequest, config.pull_request_url(number));
+        sections.insert(
+            MessageSection::PullRequest,
+            self.config.pull_request_url(number),
+        );
 
         let reviewers: HashMap<String, ReviewStatus> = pr
             .latest_opinionated_reviews
@@ -351,20 +454,39 @@ impl GitHub {
         head_ref_name: String,
         draft: bool,
     ) -> Result<u64> {
-        let number = octocrab::instance()
-            .pulls(self.config.owner.clone(), self.config.repo.clone())
-            .create(
-                message
+        let repo = self.get_repo_info().await?;
+        let repository_id = repo
+            .repository
+            .ok_or_else(|| Error::new("Unable to find repository"))?
+            .id;
+
+        let variables = create_pull_request::Variables {
+            input: CreatePullRequestInput {
+                title: message
                     .get(&MessageSection::Title)
-                    .unwrap_or(&String::new()),
+                    .unwrap_or(&String::new())
+                    .into(),
+                repository_id,
                 head_ref_name,
                 base_ref_name,
-            )
-            .body(build_github_body(message))
-            .draft(Some(draft))
-            .send()
-            .await?
-            .number;
+                maintainer_can_modify: Some(true),
+                body: Some(build_github_body(message)),
+                draft: Some(draft),
+                client_mutation_id: None,
+                head_repository_id: None,
+            },
+        };
+
+        let pr = self.post_graphql::<CreatePullRequest>(variables).await?;
+
+        let number = pr
+            .data
+            .ok_or_else(|| Error::new("Unable to find pr data"))?
+            .create_pull_request
+            .ok_or_else(|| Error::new("Unable to find pr data (create_pull_request)"))?
+            .pull_request
+            .ok_or_else(|| Error::new("Unable to find pr data (pull_request)"))?
+            .number as u64;
 
         Ok(number)
     }
@@ -412,16 +534,10 @@ impl GitHub {
             owner: self.config.owner.clone(),
             number: number as i64,
         };
-        let request_body = PullRequestMergeabilityQuery::build_query(variables);
-        let res = self
-            .graphql_client
-            .post("https://api.github.com/graphql")
-            .json(&request_body)
-            .send()
-            .await?;
-        let response_body: Response<pull_request_mergeability_query::ResponseData> =
-            res.json().await?;
 
+        let response_body = self
+            .post_graphql::<PullRequestMergeabilityQuery>(variables)
+            .await?;
         if let Some(errors) = response_body.errors {
             let error = Err(Error::new(format!(
                 "querying PR #{number} mergeability failed"
@@ -452,6 +568,19 @@ impl GitHub {
                 .merge_commit
                 .and_then(|sha| git2::Oid::from_str(&sha.oid).ok()),
         })
+    }
+
+    pub async fn get_repo_info(&self) -> Result<repository_query::ResponseData> {
+        let variables = repository_query::Variables {
+            owner: self.config.owner.clone(),
+            name: self.config.repo.clone(),
+        };
+
+        let response_body = self.post_graphql::<RepositoryQuery>(variables).await?;
+
+        response_body
+            .data
+            .ok_or_else(|| Error::new("failed to get repository info"))
     }
 }
 

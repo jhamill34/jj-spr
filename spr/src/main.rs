@@ -14,6 +14,7 @@ use jj_spr::{
     commands,
     config::{get_auth_token, get_config_bool, get_config_value},
     error::{Error, Result, ResultExt},
+    github::create_graphql_client,
     output::output,
 };
 use reqwest::{self, header};
@@ -144,6 +145,10 @@ pub async fn spr() -> Result<()> {
         .ok_or_else(|| Error::new("spr.branchPrefix must be configured".to_string()))?;
     let require_approval = get_config_bool("spr.requireApproval", &git_config).unwrap_or(false);
     let require_test_plan = get_config_bool("spr.requireTestPlan", &git_config).unwrap_or(true);
+    let gh_host =
+        get_config_value("spr.githubHost", &git_config).unwrap_or_else(|| "github.com".to_string());
+    let gh_api_base_uri = get_config_value("spr.githubApiBaseUri", &git_config)
+        .unwrap_or_else(|| "https://api.github.com".to_string());
 
     let config = jj_spr::config::Config::new(
         github_owner,
@@ -153,6 +158,8 @@ pub async fn spr() -> Result<()> {
         branch_prefix,
         require_approval,
         require_test_plan,
+        gh_host,
+        gh_api_base_uri,
     );
 
     let jj = jj_spr::jj::Jujutsu::new(repo)
@@ -168,23 +175,10 @@ pub async fn spr() -> Result<()> {
             .ok_or_else(|| Error::new("GitHub auth token must be configured".to_string()))?,
     };
 
+    // TODO: REMOVE THIS!
     octocrab::initialise(octocrab::Octocrab::builder().personal_token(github_auth_token.clone()))?;
 
-    let mut headers = header::HeaderMap::new();
-    headers.insert(header::ACCEPT, "application/json".parse()?);
-    headers.insert(
-        header::USER_AGENT,
-        format!("spr/{}", env!("CARGO_PKG_VERSION")).try_into()?,
-    );
-    headers.insert(
-        header::AUTHORIZATION,
-        format!("Bearer {}", github_auth_token).parse()?,
-    );
-
-    let graphql_client = reqwest::Client::builder()
-        .default_headers(headers)
-        .build()?;
-
+    let graphql_client = create_graphql_client(&github_auth_token)?;
     let mut gh = jj_spr::github::GitHub::new(config.clone(), graphql_client.clone());
 
     match cli.command {

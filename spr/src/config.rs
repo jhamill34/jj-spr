@@ -18,6 +18,8 @@ pub struct Config {
     pub branch_prefix: String,
     pub require_approval: bool,
     pub require_test_plan: bool,
+    pub gh_host: String,
+    pub gh_api_base_uri: String,
 }
 
 impl Config {
@@ -29,6 +31,8 @@ impl Config {
         branch_prefix: String,
         require_approval: bool,
         require_test_plan: bool,
+        gh_host: String,
+        gh_api_base_uri: String,
     ) -> Self {
         let master_ref =
             GitHubBranch::new_from_branch_name(&master_branch, &remote_name, &master_branch);
@@ -40,12 +44,15 @@ impl Config {
             branch_prefix,
             require_approval,
             require_test_plan,
+            gh_host,
+            gh_api_base_uri,
         }
     }
 
     pub fn pull_request_url(&self, number: u64) -> String {
         format!(
-            "https://github.com/{owner}/{repo}/pull/{number}",
+            "https://{host}/{owner}/{repo}/pull/{number}",
+            host = &self.gh_host,
             owner = &self.owner,
             repo = &self.repo
         )
@@ -63,14 +70,15 @@ impl Config {
         }
 
         let regex = lazy_regex::regex!(
-            r#"^\s*https?://github.com/([\w\-\.]+)/([\w\-\.]+)/pull/(\d+)([/?#].*)?\s*$"#
+            r#"^\s*https?://([\w\-\.]+)/([\w\-\.]+)/([\w\-\.]+)/pull/(\d+)([/?#].*)?\s*$"#
         );
         let m = regex.captures(text);
         if let Some(caps) = m
-            && self.owner == caps.get(1).unwrap().as_str()
-            && self.repo == caps.get(2).unwrap().as_str()
+            && self.gh_host == caps.get(1).unwrap().as_str()
+            && self.owner == caps.get(2).unwrap().as_str()
+            && self.repo == caps.get(3).unwrap().as_str()
         {
-            return Some(caps.get(3).unwrap().as_str().parse().unwrap());
+            return Some(caps.get(4).unwrap().as_str().parse().unwrap());
         }
 
         None
@@ -233,6 +241,8 @@ mod tests {
             "spr/foo/".into(),
             false,
             true,
+            "github.com".into(),
+            "https://api.github.com".into(),
         )
     }
 

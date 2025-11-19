@@ -929,6 +929,8 @@ mod tests {
             "spr/test/".into(),
             false,
             false,
+            "github.com".into(),
+            "https://api.github.com".into(),
         )
     }
 

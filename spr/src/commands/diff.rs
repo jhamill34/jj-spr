@@ -9,9 +9,7 @@ use std::iter::zip;
 
 use crate::{
     error::{Error, Result, ResultExt, add_error},
-    github::{
-        GitHub, PullRequest, PullRequestRequestReviewers, PullRequestState, PullRequestUpdate,
-    },
+    github::{PullRequest, PullRequestRequestReviewers, PullRequestState, PullRequestUpdate},
     message::{MessageSection, validate_commit_message},
     output::{output, write_commit_title},
     utils::{parse_name_list, remove_all_parens, run_command},
@@ -255,7 +253,9 @@ async fn diff_impl(
         for reviewer in reviewers {
             // Teams are indicated with a leading #
             if let Some(slug) = reviewer.strip_prefix('#') {
-                if let Ok(team) = GitHub::get_github_team((&config.owner).into(), slug.into()).await
+                if let Ok(team) = gh
+                    .get_github_team((&config.owner).into(), slug.into())
+                    .await
                 {
                     requested_reviewers
                         .team_reviewers
@@ -268,7 +268,7 @@ async fn diff_impl(
                         reviewer
                     )));
                 }
-            } else if let Ok(user) = GitHub::get_github_user(reviewer.clone()).await {
+            } else if let Ok(user) = gh.get_github_user(reviewer.clone()).await {
                 requested_reviewers.reviewers.push(user.login);
                 if let Some(name) = user.name {
                     checked_reviewers.push(format!(
@@ -672,6 +672,8 @@ mod tests {
             "spr/test/".into(),
             false,
             false,
+            "github.com".into(),
+            "https://api.github.com".into(),
         )
     }
 
