@@ -5,9 +5,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use futures::future;
+
 use crate::{
     error::{Error, Result},
-    jj::PreparedCommit,
+    github::gh_trait::GitHubClient,
     message::validate_commit_message,
     output::{output, write_commit_title},
 };
@@ -28,12 +30,15 @@ pub struct AmendOptions {
     revision: Option<String>,
 }
 
-pub async fn amend(
+pub async fn amend<G>(
     opts: AmendOptions,
     jj: &crate::jj::Jujutsu,
-    gh: &mut crate::github::GitHub,
+    gh: &G,
     config: &crate::config::Config,
-) -> Result<()> {
+) -> Result<()>
+where
+    G: GitHubClient,
+{
     // Determine revision and whether to use range mode
     let (use_range_mode, base_rev, target_rev, is_inclusive) =
         crate::revision_utils::parse_revision_and_range(
@@ -53,26 +58,20 @@ pub async fn amend(
         return Ok(());
     }
 
-    // Request the Pull Request information for each commit (well, those that
-    // declare to have Pull Requests).
-    let pull_requests: Vec<_> = pc
+    let pull_request_futures: Vec<_> = pc
         .iter()
-        .map(|commit: &PreparedCommit| {
-            commit
-                .pull_request_number
-                .map(|number| tokio::spawn(gh.clone().get_pull_request(number)))
-        })
+        .flat_map(|commit| commit.pull_request_number)
+        .map(|number| gh.get_pull_request(number))
         .collect();
+
+    let pull_requests = future::join_all(pull_request_futures).await;
 
     let mut failure = false;
 
     for (commit, pull_request) in pc.iter_mut().zip(pull_requests.into_iter()) {
         write_commit_title(commit)?;
-        if let Some(pull_request) = pull_request {
-            let pull_request = pull_request.await??;
-            commit.message = pull_request.sections;
-            commit.message_changed = true;
-        }
+        commit.message = pull_request?.sections;
+        commit.message_changed = true;
         failure = validate_commit_message(&commit.message).is_err() || failure;
     }
     jj.rewrite_commit_messages(&mut pc)?;

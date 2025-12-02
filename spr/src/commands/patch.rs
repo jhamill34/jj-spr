@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use crate::error::Result;
+use crate::{error::Result, github::gh_trait::GitHubClient};
 
 #[derive(Debug, clap::Parser)]
 pub struct PatchOptions {
@@ -21,12 +21,15 @@ pub struct PatchOptions {
     no_checkout: bool,
 }
 
-pub async fn patch(
+pub async fn patch<G>(
     _opts: PatchOptions,
     _jj: &crate::jj::Jujutsu,
-    _gh: &mut crate::github::GitHub,
+    _gh: &G,
     _config: &crate::config::Config,
-) -> Result<()> {
+) -> Result<()>
+where
+    G: GitHubClient,
+{
     // TODO: Implement Jujutsu-native patch functionality
     // This command needs to be completely rewritten for Jujutsu workflow
     // The current implementation uses complex Git operations that need

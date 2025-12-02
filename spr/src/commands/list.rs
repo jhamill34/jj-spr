@@ -7,18 +7,10 @@
 
 use crate::error::Error;
 use crate::error::Result;
+use crate::github::gql::SearchQuery;
+use crate::github::gql::search_query;
 use graphql_client::{GraphQLQuery, Response};
 use reqwest;
-
-#[allow(clippy::upper_case_acronyms)]
-type URI = String;
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "src/gql/schema.docs.graphql",
-    query_path = "src/gql/open_reviews.graphql",
-    response_derives = "Debug"
-)]
-pub struct SearchQuery;
 
 pub async fn list(graphql_client: reqwest::Client, config: &crate::config::Config) -> Result<()> {
     let variables = search_query::Variables {

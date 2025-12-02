@@ -10,12 +10,14 @@ use std::iter::zip;
 use crate::{
     error::{Error, Result, ResultExt, add_error},
     github::{
-        GitHub, PullRequest, PullRequestRequestReviewers, PullRequestState, PullRequestUpdate,
+        gh_trait::GitHubClient,
+        pr::{PullRequest, PullRequestRequestReviewers, PullRequestState, PullRequestUpdate},
     },
     message::{MessageSection, validate_commit_message},
     output::{output, write_commit_title},
     utils::{parse_name_list, remove_all_parens, run_command},
 };
+use futures::future;
 use git2::Oid;
 use indoc::{formatdoc, indoc};
 
@@ -54,12 +56,15 @@ pub struct DiffOptions {
     revision: Option<String>,
 }
 
-pub async fn diff(
+pub async fn diff<G>(
     opts: DiffOptions,
     jj: &crate::jj::Jujutsu,
-    gh: &mut crate::github::GitHub,
+    gh: &G,
     config: &crate::config::Config,
-) -> Result<()> {
+) -> Result<()>
+where
+    G: GitHubClient + Clone + 'static,
+{
     let mut result = Ok(());
 
     // Determine revision and whether to use range mode
@@ -93,29 +98,22 @@ pub async fn diff(
         return result;
     };
 
-    #[allow(clippy::needless_collect)]
-    let pull_request_tasks: Vec<_> = prepared_commits
+    let pull_request_futures: Vec<_> = prepared_commits
         .iter()
-        .map(|pc: &crate::jj::PreparedCommit| {
-            pc.pull_request_number
-                .map(|number| tokio::spawn(gh.clone().get_pull_request(number)))
-        })
+        .flat_map(|commit| commit.pull_request_number)
+        .map(|number| gh.get_pull_request(number))
         .collect();
+
+    let pull_requests = future::join_all(pull_request_futures).await;
 
     let mut message_on_prompt = "".to_string();
 
     for (prepared_commit, pull_request_task) in
-        zip(prepared_commits.iter_mut(), pull_request_tasks.into_iter())
+        zip(prepared_commits.iter_mut(), pull_requests.into_iter())
     {
         if result.is_err() {
             break;
         }
-
-        let pull_request = if let Some(task) = pull_request_task {
-            Some(task.await??)
-        } else {
-            None
-        };
 
         write_commit_title(prepared_commit)?;
 
@@ -131,7 +129,7 @@ pub async fn diff(
             config,
             prepared_commit,
             master_base_oid,
-            pull_request,
+            pull_request_task.ok(),
         )
         .await;
     }
@@ -147,16 +145,19 @@ pub async fn diff(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn diff_impl(
+async fn diff_impl<G>(
     opts: &DiffOptions,
     message_on_prompt: &mut String,
     jj: &crate::jj::Jujutsu,
-    gh: &mut crate::github::GitHub,
+    gh: &G,
     config: &crate::config::Config,
     local_commit: &mut crate::jj::PreparedCommit,
     master_base_oid: Oid,
     pull_request: Option<PullRequest>,
-) -> Result<()> {
+) -> Result<()>
+where
+    G: GitHubClient,
+{
     // Parsed commit message of the local commit
     let message = &mut local_commit.message;
 
@@ -252,7 +253,9 @@ async fn diff_impl(
         for reviewer in reviewers {
             // Teams are indicated with a leading #
             if let Some(slug) = reviewer.strip_prefix('#') {
-                if let Ok(team) = GitHub::get_github_team((&config.owner).into(), slug.into()).await
+                if let Ok(team) = gh
+                    .get_github_team((&config.owner).into(), slug.into())
+                    .await
                 {
                     requested_reviewers
                         .team_reviewers
@@ -265,7 +268,7 @@ async fn diff_impl(
                         reviewer
                     )));
                 }
-            } else if let Ok(user) = GitHub::get_github_user(reviewer.clone()).await {
+            } else if let Ok(user) = gh.get_github_user(reviewer.clone()).await {
                 requested_reviewers.reviewers.push(user.login);
                 if let Some(name) = user.name {
                     checked_reviewers.push(format!(

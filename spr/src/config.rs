@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use crate::{error::Result, github::GitHubBranch, utils::slugify};
+use crate::{error::Result, github::branch::GitHubBranch, utils::slugify};
 
 #[derive(Clone, Debug)]
 pub struct Config {

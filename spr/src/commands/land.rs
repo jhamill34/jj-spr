@@ -10,7 +10,10 @@ use std::{io::Write, process::Stdio, time::Duration};
 
 use crate::{
     error::{Error, Result, ResultExt},
-    github::{PullRequestState, PullRequestUpdate, ReviewStatus},
+    github::{
+        gh_trait::GitHubClient,
+        pr::{PullRequestState, PullRequestUpdate, ReviewStatus},
+    },
     message::build_github_body_for_merging,
     output::{output, write_commit_title},
     utils::run_command,
@@ -28,12 +31,15 @@ pub struct LandOptions {
     revision: Option<String>,
 }
 
-pub async fn land(
+pub async fn land<G>(
     opts: LandOptions,
     jj: &crate::jj::Jujutsu,
-    gh: &mut crate::github::GitHub,
+    gh: &G,
     config: &crate::config::Config,
-) -> Result<()> {
+) -> Result<()>
+where
+    G: GitHubClient,
+{
     let revision = opts.revision.as_deref().unwrap_or("@");
     let prepared_commit = jj.get_prepared_commit_for_revision(config, revision)?;
 
@@ -50,7 +56,7 @@ pub async fn land(
     };
 
     // Load Pull Request information
-    let pull_request = gh.clone().get_pull_request(pull_request_number).await?;
+    let pull_request = gh.get_pull_request(pull_request_number).await?;
 
     if pull_request.state != PullRequestState::Open {
         return Err(Error::new(formatdoc!(

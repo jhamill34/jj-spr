@@ -11,7 +11,10 @@ use indoc::formatdoc;
 
 use crate::{
     error::{Error, Result, add_error},
-    github::{PullRequestState, PullRequestUpdate},
+    github::{
+        gh_trait::GitHubClient,
+        pr::{PullRequestState, PullRequestUpdate},
+    },
     jj::PreparedCommit,
     message::MessageSection,
     output::{output, write_commit_title},
@@ -33,12 +36,15 @@ pub struct CloseOptions {
     revision: Option<String>,
 }
 
-pub async fn close(
+pub async fn close<G>(
     opts: CloseOptions,
     jj: &crate::jj::Jujutsu,
-    gh: &mut crate::github::GitHub,
+    gh: &G,
     config: &crate::config::Config,
-) -> Result<()> {
+) -> Result<()>
+where
+    G: GitHubClient + Clone,
+{
     let mut result = Ok(());
 
     // Determine revision and whether to use range mode
@@ -84,11 +90,14 @@ pub async fn close(
     result
 }
 
-async fn close_impl(
-    gh: &mut crate::github::GitHub,
+async fn close_impl<G>(
+    gh: &G,
     config: &crate::config::Config,
     prepared_commit: &mut PreparedCommit,
-) -> Result<()> {
+) -> Result<()>
+where
+    G: GitHubClient + Clone,
+{
     let pull_request_number = if let Some(number) = prepared_commit.pull_request_number {
         output("#️⃣ ", &format!("Pull Request #{}", number))?;
         number

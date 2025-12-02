@@ -15,7 +15,7 @@ use std::{
 use crate::{
     config::Config,
     error::{Error, Result, ResultExt},
-    github::GitHubBranch,
+    github::branch::GitHubBranch,
     message::{MessageSection, MessageSectionsMap, build_commit_message, parse_message},
     utils::run_command,
 };

@@ -5,11 +5,28 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+pub mod branch;
+pub mod gh_trait;
+pub mod gql;
+pub mod pr;
+
+use async_trait::async_trait;
 use graphql_client::{GraphQLQuery, Response};
 use serde::Deserialize;
 
 use crate::{
     error::{Error, Result, ResultExt},
+    github::{
+        gh_trait::{GitHubClient, UserWithName},
+        gql::{
+            PullRequestMergeabilityQuery, PullRequestQuery, pull_request_mergeability_query,
+            pull_request_query,
+        },
+        pr::{
+            PullRequest, PullRequestMergeability, PullRequestRequestReviewers, PullRequestState,
+            PullRequestUpdate, ReviewStatus,
+        },
+    },
     message::{MessageSection, MessageSectionsMap, build_github_body, parse_message},
 };
 use std::collections::{HashMap, HashSet};
@@ -20,105 +37,6 @@ pub struct GitHub {
     graphql_client: reqwest::Client,
 }
 
-#[derive(Debug, Clone)]
-pub struct PullRequest {
-    pub number: u64,
-    pub state: PullRequestState,
-    pub title: String,
-    pub body: Option<String>,
-    pub sections: MessageSectionsMap,
-    pub base: GitHubBranch,
-    pub head: GitHubBranch,
-    pub base_oid: git2::Oid,
-    pub head_oid: git2::Oid,
-    pub merge_commit: Option<git2::Oid>,
-    pub reviewers: HashMap<String, ReviewStatus>,
-    pub review_status: Option<ReviewStatus>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReviewStatus {
-    Requested,
-    Approved,
-    Rejected,
-}
-
-#[derive(serde::Serialize, Default, Debug)]
-pub struct PullRequestUpdate {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub body: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state: Option<PullRequestState>,
-}
-
-impl PullRequestUpdate {
-    pub fn is_empty(&self) -> bool {
-        self.title.is_none() && self.body.is_none() && self.base.is_none() && self.state.is_none()
-    }
-
-    pub fn update_message(&mut self, pull_request: &PullRequest, message: &MessageSectionsMap) {
-        let title = message.get(&MessageSection::Title);
-        if title.is_some() && title != Some(&pull_request.title) {
-            self.title = title.cloned();
-        }
-
-        let body = build_github_body(message);
-        if pull_request.body.as_ref() != Some(&body) {
-            self.body = Some(body);
-        }
-    }
-}
-
-#[derive(serde::Serialize, Default, Debug)]
-pub struct PullRequestRequestReviewers {
-    pub reviewers: Vec<String>,
-    pub team_reviewers: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PullRequestState {
-    Open,
-    Closed,
-}
-
-#[derive(serde::Deserialize, Debug, Clone)]
-pub struct UserWithName {
-    pub login: String,
-    pub name: Option<String>,
-    #[serde(default)]
-    pub is_collaborator: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct PullRequestMergeability {
-    pub base: GitHubBranch,
-    pub head_oid: git2::Oid,
-    pub mergeable: Option<bool>,
-    pub merge_commit: Option<git2::Oid>,
-}
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "src/gql/schema.docs.graphql",
-    query_path = "src/gql/pullrequest_query.graphql",
-    response_derives = "Debug"
-)]
-pub struct PullRequestQuery;
-type GitObjectID = String;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "src/gql/schema.docs.graphql",
-    query_path = "src/gql/pullrequest_mergeability_query.graphql",
-    response_derives = "Debug"
-)]
-pub struct PullRequestMergeabilityQuery;
-
 impl GitHub {
     pub fn new(config: crate::config::Config, graphql_client: reqwest::Client) -> Self {
         Self {
@@ -126,15 +44,19 @@ impl GitHub {
             graphql_client,
         }
     }
+}
 
-    pub async fn get_github_user(login: String) -> Result<UserWithName> {
+#[async_trait]
+impl GitHubClient for GitHub {
+    async fn get_github_user(&self, login: String) -> Result<UserWithName> {
         octocrab::instance()
             .get::<UserWithName, _, _>(format!("users/{}", login), None::<&()>)
             .await
             .map_err(Error::from)
     }
 
-    pub async fn get_github_team(
+    async fn get_github_team(
+        &self,
         owner: String,
         team: String,
     ) -> Result<octocrab::models::teams::Team> {
@@ -145,7 +67,7 @@ impl GitHub {
             .map_err(Error::from)
     }
 
-    pub async fn get_pull_request(self, number: u64) -> Result<PullRequest> {
+    async fn get_pull_request(&self, number: u64) -> Result<PullRequest> {
         let GitHub {
             config,
             graphql_client,
@@ -344,7 +266,7 @@ impl GitHub {
         })
     }
 
-    pub async fn create_pull_request(
+    async fn create_pull_request(
         &self,
         message: &MessageSectionsMap,
         base_ref_name: String,
@@ -369,7 +291,7 @@ impl GitHub {
         Ok(number)
     }
 
-    pub async fn update_pull_request(&self, number: u64, updates: PullRequestUpdate) -> Result<()> {
+    async fn update_pull_request(&self, number: u64, updates: PullRequestUpdate) -> Result<()> {
         octocrab::instance()
             .patch::<octocrab::models::pulls::PullRequest, _, _>(
                 format!(
@@ -383,7 +305,7 @@ impl GitHub {
         Ok(())
     }
 
-    pub async fn request_reviewers(
+    async fn request_reviewers(
         &self,
         number: u64,
         reviewers: PullRequestRequestReviewers,
@@ -403,10 +325,7 @@ impl GitHub {
         Ok(())
     }
 
-    pub async fn get_pull_request_mergeability(
-        &self,
-        number: u64,
-    ) -> Result<PullRequestMergeability> {
+    async fn get_pull_request_mergeability(&self, number: u64) -> Result<PullRequestMergeability> {
         let variables = pull_request_mergeability_query::Variables {
             name: self.config.repo.clone(),
             owner: self.config.owner.clone(),
@@ -455,73 +374,9 @@ impl GitHub {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct GitHubBranch {
-    ref_on_github: String,
-    ref_local: String,
-    is_master_branch: bool,
-}
-
-impl GitHubBranch {
-    pub fn new_from_ref(ghref: &str, remote_name: &str, master_branch_name: &str) -> Result<Self> {
-        let ref_on_github = if ghref.starts_with("refs/heads/") {
-            ghref.to_string()
-        } else if ghref.starts_with("refs/") {
-            return Err(Error::new(format!(
-                "Ref '{ghref}' does not refer to a branch"
-            )));
-        } else {
-            format!("refs/heads/{ghref}")
-        };
-
-        // The branch name is `ref_on_github` with the `refs/heads/` prefix
-        // (length 11) removed
-        let branch_name = &ref_on_github[11..];
-        let ref_local = format!("refs/remotes/{remote_name}/{branch_name}");
-        let is_master_branch = branch_name == master_branch_name;
-
-        Ok(Self {
-            ref_on_github,
-            ref_local,
-            is_master_branch,
-        })
-    }
-
-    pub fn new_from_branch_name(
-        branch_name: &str,
-        remote_name: &str,
-        master_branch_name: &str,
-    ) -> Self {
-        Self {
-            ref_on_github: format!("refs/heads/{branch_name}"),
-            ref_local: format!("refs/remotes/{remote_name}/{branch_name}"),
-            is_master_branch: branch_name == master_branch_name,
-        }
-    }
-
-    pub fn on_github(&self) -> &str {
-        &self.ref_on_github
-    }
-
-    pub fn local(&self) -> &str {
-        &self.ref_local
-    }
-
-    pub fn is_master_branch(&self) -> bool {
-        self.is_master_branch
-    }
-
-    pub fn branch_name(&self) -> &str {
-        // The branch name is `ref_on_github` with the `refs/heads/` prefix
-        // (length 11) removed
-        &self.ref_on_github[11..]
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    // Note this useful idiom: importing names from outer (for mod tests) scope.
-    use super::*;
+    use crate::github::branch::GitHubBranch;
 
     #[test]
     fn test_new_from_ref_with_branch_name() {
