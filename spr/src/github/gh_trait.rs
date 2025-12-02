@@ -23,6 +23,8 @@ pub struct UserWithName {
 
 #[async_trait]
 pub trait GitHubClient {
+    async fn get_current_user(&self) -> Result<octocrab::models::Author>;
+
     async fn get_github_user(&self, login: String) -> Result<UserWithName>;
 
     async fn get_github_team(
@@ -30,6 +32,12 @@ pub trait GitHubClient {
         owner: String,
         team: String,
     ) -> Result<octocrab::models::teams::Team>;
+
+    async fn get_repository(
+        &self,
+        owner: String,
+        repo: String,
+    ) -> Result<octocrab::models::Repository>;
 
     async fn get_pull_request(&self, number: u64, config: &Config) -> Result<PullRequest>;
 

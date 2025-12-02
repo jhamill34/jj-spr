@@ -13,6 +13,8 @@ pub mod pr;
 use async_trait::async_trait;
 use graphql_client::{GraphQLQuery, Response};
 use indoc::formatdoc;
+use octocrab::models::Author;
+use reqwest::header;
 use serde::Deserialize;
 
 use crate::{
@@ -45,15 +47,46 @@ impl GitHub {
     pub fn new(graphql_client: reqwest::Client) -> Self {
         Self { graphql_client }
     }
+
+    pub fn from_token(token: String) -> Result<Self> {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::ACCEPT, "application/json".parse()?);
+        headers.insert(
+            header::USER_AGENT,
+            format!("spr/{}", env!("CARGO_PKG_VERSION")).try_into()?,
+        );
+        headers.insert(header::AUTHORIZATION, format!("Bearer {}", token).parse()?);
+
+        let graphql_client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()?;
+
+        Ok(Self { graphql_client })
+    }
 }
 
 #[async_trait]
 impl GitHubClient for GitHub {
-    async fn get_github_user(&self, login: String) -> Result<UserWithName> {
+    async fn get_current_user(&self) -> Result<Author> {
         octocrab::instance()
-            .get::<UserWithName, _, _>(format!("users/{}", login), None::<&()>)
+            .current()
+            .user()
             .await
             .map_err(Error::from)
+    }
+
+    async fn get_github_user(&self, login: String) -> Result<UserWithName> {
+        let profile = octocrab::instance()
+            .users(login)
+            .profile()
+            .await
+            .map_err(Error::from)?;
+
+        Ok(UserWithName {
+            login: profile.login,
+            name: profile.name,
+            is_collaborator: false,
+        })
     }
 
     async fn get_github_team(
@@ -64,6 +97,18 @@ impl GitHubClient for GitHub {
         octocrab::instance()
             .teams(owner)
             .get(team)
+            .await
+            .map_err(Error::from)
+    }
+
+    async fn get_repository(
+        &self,
+        owner: String,
+        repo: String,
+    ) -> Result<octocrab::models::Repository> {
+        octocrab::instance()
+            .repos(owner, repo)
+            .get()
             .await
             .map_err(Error::from)
     }

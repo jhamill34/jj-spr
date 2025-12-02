@@ -13,10 +13,10 @@ use clap::{Parser, Subcommand};
 use jj_spr::{
     commands,
     config::{get_auth_token, get_config_bool, get_config_value},
-    error::{Error, Result, ResultExt},
+    error::{Error, OptionsError, Result, ResultExt},
+    github,
     output::output,
 };
-use reqwest::{self, header};
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -72,12 +72,6 @@ enum Commands {
 
     /// Close a Pull request
     Close(commands::close::CloseOptions),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum OptionsError {
-    #[error("GitHub repository must be given as 'OWNER/REPO', but given value was '{0}'")]
-    InvalidRepository(String),
 }
 
 pub async fn spr() -> Result<()> {
@@ -172,23 +166,7 @@ pub async fn spr() -> Result<()> {
             .build()?,
     );
 
-    let mut headers = header::HeaderMap::new();
-    headers.insert(header::ACCEPT, "application/json".parse()?);
-    headers.insert(
-        header::USER_AGENT,
-        format!("spr/{}", env!("CARGO_PKG_VERSION")).try_into()?,
-    );
-    headers.insert(
-        header::AUTHORIZATION,
-        format!("Bearer {}", github_auth_token).parse()?,
-    );
-
-    let graphql_client = reqwest::Client::builder()
-        .default_headers(headers)
-        .build()?;
-
-    let gh = jj_spr::github::GitHub::new(graphql_client.clone());
-
+    let gh = github::GitHub::from_token(github_auth_token)?;
     match cli.command {
         Commands::Diff(opts) => commands::diff::diff(opts, &jj, &gh, &config).await?,
         Commands::Land(opts) => commands::land::land(opts, &jj, &gh, &config).await?,

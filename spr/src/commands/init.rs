@@ -10,7 +10,8 @@ use lazy_regex::regex;
 
 use crate::{
     config::{AuthTokenSource, get_auth_token_with_source, set_jj_config},
-    error::{Error, Result, ResultExt},
+    error::{Error, OptionsError, Result, ResultExt},
+    github::{self, gh_trait::GitHubClient},
     output::output,
 };
 
@@ -85,11 +86,15 @@ pub async fn init() -> Result<()> {
         pat
     };
 
-    let octocrab = octocrab::OctocrabBuilder::default()
-        .personal_token(pat.clone())
-        .build()?;
-    let github_user = octocrab.current().user().await?;
+    let gh = github::GitHub::from_token(pat.clone())?;
 
+    octocrab::initialise(
+        octocrab::OctocrabBuilder::default()
+            .personal_token(pat.clone())
+            .build()?,
+    );
+
+    let github_user = gh.get_current_user().await?;
     output("👋", &formatdoc!("Hello {}!", github_user.login))?;
 
     if !reuse_token {
@@ -134,7 +139,7 @@ pub async fn init() -> Result<()> {
 
     let url = repo.find_remote(&remote)?.url().map(String::from);
     let regex = lazy_regex::regex!(r#"github\.com[/:]([\w\-\.]+/[\w\-\.]+?)(.git)?$"#);
-    let github_repo = config
+    let github_repository = config
         .get_string("spr.githubRepository")
         .ok()
         .and_then(|value| if value.is_empty() { None } else { Some(value) })
@@ -146,17 +151,24 @@ pub async fn init() -> Result<()> {
         })
         .unwrap_or_default();
 
-    let github_repo = dialoguer::Input::<String>::new()
+    let github_repository = dialoguer::Input::<String>::new()
         .with_prompt("GitHub repository")
-        .with_initial_text(github_repo)
+        .with_initial_text(github_repository)
         .interact_text()?;
-    set_jj_config("spr.githubRepository", &github_repo, &path)?;
+    set_jj_config("spr.githubRepository", &github_repository, &path)?;
 
     // Master branch name (just query GitHub)
+    let (github_owner, github_repo) = {
+        let captures = lazy_regex::regex!(r#"^([\w\-\.]+)/([\w\-\.]+)$"#)
+            .captures(&github_repository)
+            .ok_or_else(|| OptionsError::InvalidRepository(github_repository.clone()))?;
+        (
+            captures.get(1).unwrap().as_str().to_string(),
+            captures.get(2).unwrap().as_str().to_string(),
+        )
+    };
 
-    let github_repo_info = octocrab
-        .get::<octocrab::models::Repository, _, _>(format!("repos/{}", &github_repo), None::<&()>)
-        .await?;
+    let github_repo_info = gh.get_repository(github_owner, github_repo).await?;
 
     set_jj_config(
         "spr.githubMasterBranch",

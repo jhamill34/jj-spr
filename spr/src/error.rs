@@ -161,3 +161,9 @@ pub fn add_error<T, U>(result: &mut Result<T>, other: Result<U>) -> Option<U> {
         }
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum OptionsError {
+    #[error("GitHub repository must be given as 'OWNER/REPO', but given value was '{0}'")]
+    InvalidRepository(String),
+}
