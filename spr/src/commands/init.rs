@@ -86,20 +86,13 @@ pub async fn init() -> Result<()> {
         pat
     };
 
-    let gh = github::GitHub::from_token(pat.clone())?;
-
-    octocrab::initialise(
-        octocrab::OctocrabBuilder::default()
-            .personal_token(pat.clone())
-            .build()?,
-    );
-
-    let github_user = gh.get_current_user().await?;
-    output("👋", &formatdoc!("Hello {}!", github_user.login))?;
-
     if !reuse_token {
         set_jj_config("spr.githubAuthToken", pat.as_str(), &path)?;
     }
+
+    let gh = github::GitHub::from_token(pat)?;
+    let github_user = gh.get_current_user().await?;
+    output("👋", &formatdoc!("Hello {}!", github_user.login))?;
 
     // Name of remote
 

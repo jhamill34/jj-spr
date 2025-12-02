@@ -41,13 +41,10 @@ use std::collections::{HashMap, HashSet};
 #[derive(Clone)]
 pub struct GitHub {
     graphql_client: reqwest::Client,
+    crab: octocrab::Octocrab,
 }
 
 impl GitHub {
-    pub fn new(graphql_client: reqwest::Client) -> Self {
-        Self { graphql_client }
-    }
-
     pub fn from_token(token: String) -> Result<Self> {
         let mut headers = header::HeaderMap::new();
         headers.insert(header::ACCEPT, "application/json".parse()?);
@@ -61,22 +58,26 @@ impl GitHub {
             .default_headers(headers)
             .build()?;
 
-        Ok(Self { graphql_client })
+        let crab = octocrab::OctocrabBuilder::default()
+            .personal_token(token.clone())
+            .build()?;
+
+        Ok(Self {
+            graphql_client,
+            crab,
+        })
     }
 }
 
 #[async_trait]
 impl GitHubClient for GitHub {
     async fn get_current_user(&self) -> Result<Author> {
-        octocrab::instance()
-            .current()
-            .user()
-            .await
-            .map_err(Error::from)
+        self.crab.current().user().await.map_err(Error::from)
     }
 
     async fn get_github_user(&self, login: String) -> Result<UserWithName> {
-        let profile = octocrab::instance()
+        let profile = self
+            .crab
             .users(login)
             .profile()
             .await
@@ -94,11 +95,7 @@ impl GitHubClient for GitHub {
         owner: String,
         team: String,
     ) -> Result<octocrab::models::teams::Team> {
-        octocrab::instance()
-            .teams(owner)
-            .get(team)
-            .await
-            .map_err(Error::from)
+        self.crab.teams(owner).get(team).await.map_err(Error::from)
     }
 
     async fn get_repository(
@@ -106,7 +103,7 @@ impl GitHubClient for GitHub {
         owner: String,
         repo: String,
     ) -> Result<octocrab::models::Repository> {
-        octocrab::instance()
+        self.crab
             .repos(owner, repo)
             .get()
             .await
@@ -317,7 +314,8 @@ impl GitHubClient for GitHub {
         head_ref_name: String,
         draft: bool,
     ) -> Result<u64> {
-        let number = octocrab::instance()
+        let number = self
+            .crab
             .pulls(owner, repo)
             .create(
                 message
@@ -342,7 +340,7 @@ impl GitHubClient for GitHub {
         number: u64,
         updates: PullRequestUpdate,
     ) -> Result<()> {
-        octocrab::instance()
+        self.crab
             .patch::<octocrab::models::pulls::PullRequest, _, _>(
                 format!("repos/{}/{}/pulls/{}", owner, repo, number),
                 Some(&updates),
@@ -361,7 +359,8 @@ impl GitHubClient for GitHub {
     ) -> Result<()> {
         #[derive(Deserialize)]
         struct Ignore {}
-        let _: Ignore = octocrab::instance()
+        let _: Ignore = self
+            .crab
             .post(
                 format!(
                     "repos/{}/{}/pulls/{}/requested_reviewers",
@@ -465,7 +464,7 @@ impl GitHubClient for GitHub {
         repo: String,
         pull_request: &PullRequest,
     ) -> Result<octocrab::models::pulls::Merge> {
-        octocrab::instance()
+        self.crab
             .pulls(owner, repo)
             .merge(pull_request.number)
             .method(octocrab::params::pulls::MergeMethod::Squash)

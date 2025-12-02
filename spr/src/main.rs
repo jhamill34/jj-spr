@@ -160,12 +160,6 @@ pub async fn spr() -> Result<()> {
             .ok_or_else(|| Error::new("GitHub auth token must be configured".to_string()))?,
     };
 
-    octocrab::initialise(
-        octocrab::OctocrabBuilder::default()
-            .personal_token(github_auth_token.clone())
-            .build()?,
-    );
-
     let gh = github::GitHub::from_token(github_auth_token)?;
     match cli.command {
         Commands::Diff(opts) => commands::diff::diff(opts, &jj, &gh, &config).await?,
