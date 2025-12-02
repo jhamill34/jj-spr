@@ -193,7 +193,7 @@ pub async fn spr() -> Result<()> {
         Commands::Diff(opts) => commands::diff::diff(opts, &jj, &gh, &config).await?,
         Commands::Land(opts) => commands::land::land(opts, &jj, &gh, &config).await?,
         Commands::Amend(opts) => commands::amend::amend(opts, &jj, &gh, &config).await?,
-        Commands::List => commands::list::list(graphql_client, &config).await?,
+        Commands::List => commands::list::list(&gh, &config).await?,
         Commands::Patch(opts) => commands::patch::patch(opts, &jj, &gh, &config).await?,
         Commands::Close(opts) => commands::close::close(opts, &jj, &gh, &config).await?,
         // The following commands are executed above and return from this

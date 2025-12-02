@@ -1,7 +1,10 @@
 use crate::{
     error::Result,
-    github::pr::{
-        PullRequest, PullRequestMergeability, PullRequestRequestReviewers, PullRequestUpdate,
+    github::{
+        gql::search_query,
+        pr::{
+            PullRequest, PullRequestMergeability, PullRequestRequestReviewers, PullRequestUpdate,
+        },
     },
     message::MessageSectionsMap,
 };
@@ -45,4 +48,10 @@ pub trait GitHubClient {
     ) -> Result<()>;
 
     async fn get_pull_request_mergeability(&self, number: u64) -> Result<PullRequestMergeability>;
+
+    async fn list_open_reviews(
+        &self,
+        owner: String,
+        repo: String,
+    ) -> Result<Vec<search_query::SearchQuerySearchNodes>>;
 }

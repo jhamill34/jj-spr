@@ -7,61 +7,43 @@
 
 use crate::error::Error;
 use crate::error::Result;
-use crate::github::gql::SearchQuery;
+use crate::github::gh_trait::GitHubClient;
 use crate::github::gql::search_query;
-use graphql_client::{GraphQLQuery, Response};
-use reqwest;
 
-pub async fn list(graphql_client: reqwest::Client, config: &crate::config::Config) -> Result<()> {
-    let variables = search_query::Variables {
-        query: format!(
-            "repo:{}/{} is:open is:pr author:@me archived:false",
-            config.owner, config.repo
-        ),
-    };
-    let request_body = SearchQuery::build_query(variables);
-    let res = graphql_client
-        .post("https://api.github.com/graphql")
-        .json(&request_body)
-        .send()
-        .await?;
-    let response_body: Response<search_query::ResponseData> = res.json().await?;
-
-    print_pr_info(response_body).ok_or_else(|| Error::new("unexpected error"))
-}
-
-fn print_pr_info(response_body: Response<search_query::ResponseData>) -> Option<()> {
+pub async fn list<G>(gh: &G, config: &crate::config::Config) -> Result<()>
+where
+    G: GitHubClient,
+{
     let term = console::Term::stdout();
-    for pr in response_body.data?.search.nodes? {
-        let pr = match pr {
-            Some(crate::commands::list::search_query::SearchQuerySearchNodes::PullRequest(pr)) => {
-                pr
-            }
-            _ => continue,
-        };
-        let dummy: String;
-        let decision = match pr.review_decision {
-            Some(search_query::PullRequestReviewDecision::APPROVED) => {
-                console::style("Accepted").green()
-            }
-            Some(search_query::PullRequestReviewDecision::CHANGES_REQUESTED) => {
-                console::style("Changes Requested").red()
-            }
-            None | Some(search_query::PullRequestReviewDecision::REVIEW_REQUIRED) => {
-                console::style("Pending")
-            }
-            Some(search_query::PullRequestReviewDecision::Other(d)) => {
-                dummy = d;
-                console::style(dummy.as_str())
-            }
-        };
-        term.write_line(&format!(
-            "{} {} {}",
-            decision,
-            console::style(&pr.title).bold(),
-            console::style(&pr.url).dim(),
-        ))
-        .ok()?;
+    let nodes = gh
+        .list_open_reviews(config.owner.clone(), config.repo.clone())
+        .await?;
+
+    for pr in nodes {
+        if let search_query::SearchQuerySearchNodes::PullRequest(pr) = pr {
+            let decision = match pr.review_decision {
+                Some(search_query::PullRequestReviewDecision::APPROVED) => {
+                    console::style("Accepted").green()
+                }
+                Some(search_query::PullRequestReviewDecision::CHANGES_REQUESTED) => {
+                    console::style("Changed Requested").red()
+                }
+                None | Some(search_query::PullRequestReviewDecision::REVIEW_REQUIRED) => {
+                    console::style("Pending")
+                }
+                Some(search_query::PullRequestReviewDecision::Other(ref d)) => {
+                    console::style(d.as_str())
+                }
+            };
+            term.write_line(&format!(
+                "{} {} {}",
+                decision,
+                console::style(&pr.title).bold(),
+                console::style(&pr.url).dim(),
+            ))
+            .map_err(|_| Error::new("Unexpected error"))?;
+        }
     }
-    Some(())
+
+    Ok(())
 }

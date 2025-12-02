@@ -19,8 +19,8 @@ use crate::{
     github::{
         gh_trait::{GitHubClient, UserWithName},
         gql::{
-            PullRequestMergeabilityQuery, PullRequestQuery, pull_request_mergeability_query,
-            pull_request_query,
+            PullRequestMergeabilityQuery, PullRequestQuery, SearchQuery,
+            pull_request_mergeability_query, pull_request_query, search_query,
         },
         pr::{
             PullRequest, PullRequestMergeability, PullRequestRequestReviewers, PullRequestState,
@@ -371,6 +371,39 @@ impl GitHubClient for GitHub {
                 .merge_commit
                 .and_then(|sha| git2::Oid::from_str(&sha.oid).ok()),
         })
+    }
+
+    async fn list_open_reviews(
+        &self,
+        owner: String,
+        repo: String,
+    ) -> Result<Vec<search_query::SearchQuerySearchNodes>> {
+        let variables = search_query::Variables {
+            query: format!(
+                "repo:{}/{} is:open is:pr author:@me archived:false",
+                owner, repo
+            ),
+        };
+        let request_body = SearchQuery::build_query(variables);
+        let res = self
+            .graphql_client
+            .post("https://api.github.com/graphql")
+            .json(&request_body)
+            .send()
+            .await?;
+        let response_body: Response<search_query::ResponseData> = res.json().await?;
+
+        let result = response_body
+            .data
+            .ok_or_else(|| Error::new("Failed to fech search query"))?
+            .search
+            .nodes
+            .ok_or_else(|| Error::new("Failed to find search nodes"))?
+            .into_iter()
+            .flatten()
+            .collect();
+
+        Ok(result)
     }
 }
 
