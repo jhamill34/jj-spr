@@ -14,7 +14,6 @@ use crate::{
         gh_trait::GitHubClient,
         pr::{PullRequestState, PullRequestUpdate, ReviewStatus},
     },
-    message::build_github_body_for_merging,
     output::{output, write_commit_title},
     utils::run_command,
 };
@@ -56,7 +55,7 @@ where
     };
 
     // Load Pull Request information
-    let pull_request = gh.get_pull_request(pull_request_number).await?;
+    let pull_request = gh.get_pull_request(pull_request_number, config).await?;
 
     if pull_request.state != PullRequestState::Open {
         return Err(Error::new(formatdoc!(
@@ -143,6 +142,8 @@ where
         // Skip the merge-in-master commit creation for Jujutsu workflow
 
         gh.update_pull_request(
+            config.owner.clone(),
+            config.repo.clone(),
             pull_request_number,
             PullRequestUpdate {
                 base: Some(config.master_ref.branch_name().to_string()),
@@ -160,7 +161,7 @@ where
         attempts += 1;
 
         let mergeability = gh
-            .get_pull_request_mergeability(pull_request_number)
+            .get_pull_request_mergeability(pull_request_number, config)
             .await?;
 
         if mergeability.head_oid != pr_head_oid {
@@ -203,26 +204,8 @@ where
             // used a base branch with this Pull Request or not. We have made sure the
             // target of the Pull Request is set to the master branch. So let GitHub do
             // the merge now!
-            octocrab::instance()
-                .pulls(&config.owner, &config.repo)
-                .merge(pull_request_number)
-                .method(octocrab::params::pulls::MergeMethod::Squash)
-                .title(pull_request.title)
-                .message(build_github_body_for_merging(&pull_request.sections))
-                .sha(format!("{}", pr_head_oid))
-                .send()
+            gh.merge_pull_request(config.owner.clone(), config.repo.clone(), &pull_request)
                 .await
-                .convert()
-                .and_then(|merge| {
-                    if merge.merged {
-                        Ok(merge)
-                    } else {
-                        Err(Error::new(formatdoc!(
-                            "GitHub Pull Request merge failed: {}",
-                            merge.message.unwrap_or_default()
-                        )))
-                    }
-                })
         }
         Err(err) => Err(err),
     };
@@ -237,6 +220,8 @@ where
             if !base_is_master {
                 let result = gh
                     .update_pull_request(
+                        config.owner.clone(),
+                        config.repo.clone(),
                         pull_request_number,
                         PullRequestUpdate {
                             base: Some(pull_request.base.on_github().to_string()),

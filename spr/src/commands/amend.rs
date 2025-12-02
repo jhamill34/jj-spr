@@ -61,7 +61,7 @@ where
     let pull_request_futures: Vec<_> = pc
         .iter()
         .flat_map(|commit| commit.pull_request_number)
-        .map(|number| gh.get_pull_request(number))
+        .map(|number| gh.get_pull_request(number, config))
         .collect();
 
     let pull_requests = future::join_all(pull_request_futures).await;

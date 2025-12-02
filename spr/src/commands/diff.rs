@@ -101,7 +101,7 @@ where
     let pull_request_futures: Vec<_> = prepared_commits
         .iter()
         .flat_map(|commit| commit.pull_request_number)
-        .map(|number| gh.get_pull_request(number))
+        .map(|number| gh.get_pull_request(number, config))
         .collect();
 
     let pull_requests = future::join_all(pull_request_futures).await;
@@ -359,8 +359,13 @@ where
 
                 if !pull_request_updates.is_empty() {
                     // ...and there are actual changes to the message
-                    gh.update_pull_request(pull_request.number, pull_request_updates)
-                        .await?;
+                    gh.update_pull_request(
+                        config.owner.clone(),
+                        config.repo.clone(),
+                        pull_request.number,
+                        pull_request_updates,
+                    )
+                    .await?;
                     output("✍", "Updated commit message on GitHub")?;
                 }
             }
@@ -594,8 +599,13 @@ where
         }
 
         if !pull_request_updates.is_empty() {
-            gh.update_pull_request(pull_request.number, pull_request_updates)
-                .await?;
+            gh.update_pull_request(
+                config.owner.clone(),
+                config.repo.clone(),
+                pull_request.number,
+                pull_request_updates,
+            )
+            .await?;
         }
     } else {
         // We are creating a new Pull Request.
@@ -616,6 +626,8 @@ where
         // Then call GitHub to create the Pull Request.
         let pull_request_number = gh
             .create_pull_request(
+                config.owner.clone(),
+                config.repo.clone(),
                 message,
                 base_branch
                     .as_ref()
@@ -641,7 +653,12 @@ where
         local_commit.message_changed = true;
 
         let result = gh
-            .request_reviewers(pull_request_number, requested_reviewers)
+            .request_reviewers(
+                config.owner.clone(),
+                config.repo.clone(),
+                pull_request_number,
+                requested_reviewers,
+            )
             .await;
         match result {
             Ok(()) => (),

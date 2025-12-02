@@ -12,9 +12,11 @@ pub mod pr;
 
 use async_trait::async_trait;
 use graphql_client::{GraphQLQuery, Response};
+use indoc::formatdoc;
 use serde::Deserialize;
 
 use crate::{
+    config::Config,
     error::{Error, Result, ResultExt},
     github::{
         gh_trait::{GitHubClient, UserWithName},
@@ -27,22 +29,21 @@ use crate::{
             PullRequestUpdate, ReviewStatus,
         },
     },
-    message::{MessageSection, MessageSectionsMap, build_github_body, parse_message},
+    message::{
+        MessageSection, MessageSectionsMap, build_github_body, build_github_body_for_merging,
+        parse_message,
+    },
 };
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone)]
 pub struct GitHub {
-    config: crate::config::Config,
     graphql_client: reqwest::Client,
 }
 
 impl GitHub {
-    pub fn new(config: crate::config::Config, graphql_client: reqwest::Client) -> Self {
-        Self {
-            config,
-            graphql_client,
-        }
+    pub fn new(graphql_client: reqwest::Client) -> Self {
+        Self { graphql_client }
     }
 }
 
@@ -67,19 +68,15 @@ impl GitHubClient for GitHub {
             .map_err(Error::from)
     }
 
-    async fn get_pull_request(&self, number: u64) -> Result<PullRequest> {
-        let GitHub {
-            config,
-            graphql_client,
-        } = self;
-
+    async fn get_pull_request(&self, number: u64, config: &Config) -> Result<PullRequest> {
         let variables = pull_request_query::Variables {
             name: config.repo.clone(),
             owner: config.owner.clone(),
             number: number as i64,
         };
         let request_body = PullRequestQuery::build_query(variables);
-        let res = graphql_client
+        let res = self
+            .graphql_client
             .post("https://api.github.com/graphql")
             .json(&request_body)
             .send()
@@ -268,13 +265,15 @@ impl GitHubClient for GitHub {
 
     async fn create_pull_request(
         &self,
+        owner: String,
+        repo: String,
         message: &MessageSectionsMap,
         base_ref_name: String,
         head_ref_name: String,
         draft: bool,
     ) -> Result<u64> {
         let number = octocrab::instance()
-            .pulls(self.config.owner.clone(), self.config.repo.clone())
+            .pulls(owner, repo)
             .create(
                 message
                     .get(&MessageSection::Title)
@@ -291,13 +290,16 @@ impl GitHubClient for GitHub {
         Ok(number)
     }
 
-    async fn update_pull_request(&self, number: u64, updates: PullRequestUpdate) -> Result<()> {
+    async fn update_pull_request(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        updates: PullRequestUpdate,
+    ) -> Result<()> {
         octocrab::instance()
             .patch::<octocrab::models::pulls::PullRequest, _, _>(
-                format!(
-                    "repos/{}/{}/pulls/{}",
-                    self.config.owner, self.config.repo, number
-                ),
+                format!("repos/{}/{}/pulls/{}", owner, repo, number),
                 Some(&updates),
             )
             .await?;
@@ -307,6 +309,8 @@ impl GitHubClient for GitHub {
 
     async fn request_reviewers(
         &self,
+        owner: String,
+        repo: String,
         number: u64,
         reviewers: PullRequestRequestReviewers,
     ) -> Result<()> {
@@ -316,7 +320,7 @@ impl GitHubClient for GitHub {
             .post(
                 format!(
                     "repos/{}/{}/pulls/{}/requested_reviewers",
-                    self.config.owner, self.config.repo, number
+                    owner, repo, number
                 ),
                 Some(&reviewers),
             )
@@ -325,10 +329,14 @@ impl GitHubClient for GitHub {
         Ok(())
     }
 
-    async fn get_pull_request_mergeability(&self, number: u64) -> Result<PullRequestMergeability> {
+    async fn get_pull_request_mergeability(
+        &self,
+        number: u64,
+        config: &Config,
+    ) -> Result<PullRequestMergeability> {
         let variables = pull_request_mergeability_query::Variables {
-            name: self.config.repo.clone(),
-            owner: self.config.owner.clone(),
+            name: config.repo.clone(),
+            owner: config.owner.clone(),
             number: number as i64,
         };
         let request_body = PullRequestMergeabilityQuery::build_query(variables);
@@ -359,7 +367,7 @@ impl GitHubClient for GitHub {
             .ok_or_else(|| Error::new("failed to find PR"))?;
 
         Ok::<_, Error>(PullRequestMergeability {
-            base: self.config.new_github_branch_from_ref(&pr.base_ref_name)?,
+            base: config.new_github_branch_from_ref(&pr.base_ref_name)?,
             head_oid: git2::Oid::from_str(&pr.head_ref_oid)?,
             mergeable: match pr.mergeable {
                 pull_request_mergeability_query::MergeableState::CONFLICTING => Some(false),
@@ -404,6 +412,34 @@ impl GitHubClient for GitHub {
             .collect();
 
         Ok(result)
+    }
+
+    async fn merge_pull_request(
+        &self,
+        owner: String,
+        repo: String,
+        pull_request: &PullRequest,
+    ) -> Result<octocrab::models::pulls::Merge> {
+        octocrab::instance()
+            .pulls(owner, repo)
+            .merge(pull_request.number)
+            .method(octocrab::params::pulls::MergeMethod::Squash)
+            .title(pull_request.title.as_str())
+            .message(build_github_body_for_merging(&pull_request.sections))
+            .sha(format!("{}", pull_request.head_oid))
+            .send()
+            .await
+            .convert()
+            .and_then(|merge| {
+                if merge.merged {
+                    Ok(merge)
+                } else {
+                    Err(Error::new(formatdoc!(
+                        "GitHub Pull Request merge failed: {}",
+                        merge.message.unwrap_or_default()
+                    )))
+                }
+            })
     }
 }
 

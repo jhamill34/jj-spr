@@ -106,7 +106,10 @@ where
     };
 
     // Load Pull Request information
-    let pull_request = gh.clone().get_pull_request(pull_request_number).await?;
+    let pull_request = gh
+        .clone()
+        .get_pull_request(pull_request_number, config)
+        .await?;
 
     if pull_request.state != PullRequestState::Open {
         return Err(Error::new(formatdoc!(
@@ -120,6 +123,8 @@ where
 
     let result = gh
         .update_pull_request(
+            config.owner.clone(),
+            config.repo.clone(),
             pull_request_number,
             PullRequestUpdate {
                 state: Some(PullRequestState::Closed),

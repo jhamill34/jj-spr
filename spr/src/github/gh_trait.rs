@@ -1,4 +1,5 @@
 use crate::{
+    config::Config,
     error::Result,
     github::{
         gql::search_query,
@@ -10,6 +11,7 @@ use crate::{
 };
 
 use async_trait::async_trait;
+use octocrab::models::pulls::Merge;
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct UserWithName {
@@ -29,29 +31,50 @@ pub trait GitHubClient {
         team: String,
     ) -> Result<octocrab::models::teams::Team>;
 
-    async fn get_pull_request(&self, number: u64) -> Result<PullRequest>;
+    async fn get_pull_request(&self, number: u64, config: &Config) -> Result<PullRequest>;
 
     async fn create_pull_request(
         &self,
+        owner: String,
+        repo: String,
         message: &MessageSectionsMap,
         base_ref_name: String,
         head_ref_name: String,
         draft: bool,
     ) -> Result<u64>;
 
-    async fn update_pull_request(&self, number: u64, updates: PullRequestUpdate) -> Result<()>;
+    async fn update_pull_request(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        updates: PullRequestUpdate,
+    ) -> Result<()>;
 
     async fn request_reviewers(
         &self,
+        owner: String,
+        repo: String,
         number: u64,
         reviewers: PullRequestRequestReviewers,
     ) -> Result<()>;
 
-    async fn get_pull_request_mergeability(&self, number: u64) -> Result<PullRequestMergeability>;
+    async fn get_pull_request_mergeability(
+        &self,
+        number: u64,
+        config: &Config,
+    ) -> Result<PullRequestMergeability>;
 
     async fn list_open_reviews(
         &self,
         owner: String,
         repo: String,
     ) -> Result<Vec<search_query::SearchQuerySearchNodes>>;
+
+    async fn merge_pull_request(
+        &self,
+        owner: String,
+        repo: String,
+        pull_request: &PullRequest,
+    ) -> Result<Merge>;
 }

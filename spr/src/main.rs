@@ -187,7 +187,7 @@ pub async fn spr() -> Result<()> {
         .default_headers(headers)
         .build()?;
 
-    let gh = jj_spr::github::GitHub::new(config.clone(), graphql_client.clone());
+    let gh = jj_spr::github::GitHub::new(graphql_client.clone());
 
     match cli.command {
         Commands::Diff(opts) => commands::diff::diff(opts, &jj, &gh, &config).await?,
