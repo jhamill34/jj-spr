@@ -28,8 +28,8 @@ pub fn message_section_label(section: &MessageSection) -> &'static str {
         Title => "Title",
         Summary => "Summary",
         Reviewers => "Reviewers",
-        ReviewedBy => "Reviewed By",
-        PullRequest => "Pull Request",
+        ReviewedBy => "Reviewed-By",
+        PullRequest => "Pull-Request",
     }
 }
 
@@ -41,14 +41,14 @@ pub fn message_section_by_label(label: &str) -> Option<MessageSection> {
         "summary" => Some(Summary),
         "reviewer" => Some(Reviewers),
         "reviewers" => Some(Reviewers),
-        "reviewed by" => Some(ReviewedBy),
-        "pull request" => Some(PullRequest),
+        "reviewed-by" => Some(ReviewedBy),
+        "pull-request" => Some(PullRequest),
         _ => None,
     }
 }
 
 pub fn parse_message(msg: &str, top_section: MessageSection) -> MessageSectionsMap {
-    let regex = lazy_regex::regex!(r#"^\s*([\w\s]+?)\s*:\s*(.*)$"#);
+    let regex = lazy_regex::regex!(r#"^\s*([\w-]+?)\s*:\s*(.*)$"#);
 
     let mut section = top_section;
     let mut lines_in_section = Vec::<&str>::new();
