@@ -5,12 +5,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::iter::zip;
+use std::{iter::zip, path::Path};
 
 use crate::{
+    config::StackStrategy,
     error::{Error, Result, ResultExt, add_error},
     github::{
-        GitHub, PullRequest, PullRequestRequestReviewers, PullRequestState, PullRequestUpdate,
+        GitHub, GitHubBranch, PullRequest, PullRequestRequestReviewers, PullRequestState,
+        PullRequestUpdate,
     },
     message::{MessageSection, validate_commit_message},
     output::{output, write_commit_title},
@@ -52,6 +54,62 @@ pub struct DiffOptions {
     /// If a range is provided, behaves like --all mode. If not specified, uses '@-'.
     #[clap(short = 'r', long)]
     revision: Option<String>,
+
+    /// Skip opening $EDITOR for new PR descriptions (useful in CI / automation)
+    #[clap(long)]
+    no_edit: bool,
+}
+
+/// Strip the spr context comment that was prepended to the editor buffer.
+/// Only removes a leading `<!-- spr: ...` block so user-written HTML comments
+/// elsewhere in the body are left intact.
+fn strip_context_comment(body: &str) -> &str {
+    if body.starts_with("<!-- spr:")
+        && let Some(end) = body.find("-->")
+    {
+        return body[end + 3..].trim_start();
+    }
+    body
+}
+
+/// Discover PR templates in the repository's `.github/` directory.
+/// Returns a list of `(display_name, content)` pairs sorted by name.
+/// Checks single-file locations first; falls back to the multi-template dir.
+fn find_pr_templates(repo_path: &Path) -> Vec<(String, String)> {
+    // Single-file locations (checked in order)
+    for rel in &[
+        ".github/PULL_REQUEST_TEMPLATE.md",
+        ".github/pull_request_template.md",
+        "PULL_REQUEST_TEMPLATE.md",
+    ] {
+        if let Ok(content) = std::fs::read_to_string(repo_path.join(rel)) {
+            return vec![("default".to_string(), content)];
+        }
+    }
+    // Directory with multiple templates
+    let dir = repo_path.join(".github/PULL_REQUEST_TEMPLATE");
+    if dir.is_dir() {
+        let mut templates: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                if path.extension()?.to_str()? == "md" {
+                    let name = path.file_name()?.to_str()?.to_string();
+                    let content = std::fs::read_to_string(&path).ok()?;
+                    Some((name, content))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        templates.sort_by(|a, b| a.0.cmp(&b.0));
+        if !templates.is_empty() {
+            return templates;
+        }
+    }
+    Vec::new()
 }
 
 pub async fn diff(
@@ -103,6 +161,11 @@ pub async fn diff(
         .collect();
 
     let mut message_on_prompt = "".to_string();
+    // Tracks the previous PR's branch and head commit OID so each PR in a stack
+    // can target the one before it as its GitHub base.
+    let mut prev_pr_info: Option<(GitHubBranch, Oid)> = None;
+    // Collects (pr_number, title) for the stack nav second pass.
+    let mut stack_prs: Vec<(u64, String)> = Vec::new();
 
     for (prepared_commit, pull_request_task) in
         zip(prepared_commits.iter_mut(), pull_request_tasks.into_iter())
@@ -123,7 +186,7 @@ pub async fn diff(
         // This makes it easier to run the code to update the local commit message
         // with all the changes that the implementation makes at the end, even if
         // the implementation encounters an error or exits early.
-        result = diff_impl(
+        match diff_impl(
             &opts,
             &mut message_on_prompt,
             jj,
@@ -132,8 +195,56 @@ pub async fn diff(
             prepared_commit,
             master_base_oid,
             pull_request,
+            prev_pr_info.take(),
         )
-        .await;
+        .await
+        {
+            Ok((branch, oid, pr_number)) => {
+                prev_pr_info = Some((branch, oid));
+                let title = prepared_commit
+                    .message
+                    .get(&MessageSection::Title)
+                    .cloned()
+                    .unwrap_or_default();
+                stack_prs.push((pr_number, title));
+            }
+            Err(e) => {
+                result = Err(e);
+            }
+        }
+    }
+
+    // Second pass: update stack navigation in PR bodies when >= 2 PRs were
+    // processed successfully.
+    if result.is_ok() && stack_prs.len() >= 2 {
+        let stack_refs: Vec<(u64, &str)> =
+            stack_prs.iter().map(|(n, t)| (*n, t.as_str())).collect();
+        for (pr_number, _) in &stack_prs {
+            let update_result: Result<()> = async {
+                let current_pr = gh.clone().get_pull_request(*pr_number).await?;
+                let current_body = current_pr.body.as_deref().unwrap_or("");
+                let stripped = crate::github::strip_stack_nav(current_body);
+                let nav =
+                    crate::github::build_stack_nav_block(&stack_refs, *pr_number, config);
+                let new_body = if stripped.trim().is_empty() {
+                    nav
+                } else {
+                    format!("{}\n\n{}", stripped.trim(), nav)
+                };
+                gh.update_pull_request(
+                    *pr_number,
+                    PullRequestUpdate {
+                        body: Some(new_body),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                output("🔗", &format!("Updated stack navigation for PR #{pr_number}"))?;
+                Ok(())
+            }
+            .await;
+            add_error(&mut result, update_result);
+        }
     }
 
     // This updates the commit message in the local Jujutsu repository (if it was
@@ -156,7 +267,8 @@ async fn diff_impl(
     local_commit: &mut crate::jj::PreparedCommit,
     master_base_oid: Oid,
     pull_request: Option<PullRequest>,
-) -> Result<()> {
+    prev_pr_info: Option<(GitHubBranch, Oid)>,
+) -> Result<(GitHubBranch, Oid, u64)> {
     // Parsed commit message of the local commit
     let message = &mut local_commit.message;
 
@@ -236,6 +348,17 @@ async fn diff_impl(
                          commit message with what is on GitHub)."
                     ),
                 )?;
+                if let Some(ref local_title) = pull_request_updates.title {
+                    output("  ", &format!("title  local : {:?}", local_title))?;
+                    output("  ", &format!("title  github: {:?}", &pull_request.title))?;
+                }
+                if let Some(ref local_body) = pull_request_updates.body {
+                    let gh_body = crate::github::strip_stack_nav(
+                        pull_request.body.as_deref().unwrap_or(""),
+                    );
+                    output("  ", &format!("body   local : {:?}", local_body.trim()))?;
+                    output("  ", &format!("body   github: {:?}", gh_body.trim()))?;
+                }
             }
         }
     }
@@ -288,6 +411,111 @@ async fn diff_impl(
         local_commit.message_changed = true;
     }
 
+    // For new PRs, open $EDITOR so the user can write the PR description.
+    // Pre-fill with a repository PR template when one is found, otherwise use
+    // whatever is already in the Summary section of the commit message.
+    if pull_request.is_none() && !opts.no_edit {
+        let templates = find_pr_templates(jj.repo_path());
+
+        // When multiple templates exist, prompt the user to pick one.
+        let template_content: Option<String> = if templates.len() > 1 {
+            let names: Vec<String> = templates.iter().map(|(n, _)| n.clone()).collect();
+            let idx = tokio::task::spawn_blocking(move || {
+                dialoguer::Select::new()
+                    .with_prompt("Select a PR template")
+                    .items(&names)
+                    .default(0)
+                    .interact()
+            })
+            .await??;
+            templates.into_iter().nth(idx).map(|(_, c)| c)
+        } else {
+            templates.into_iter().next().map(|(_, c)| c)
+        };
+
+        // Build a context comment shown at the top of the editor so the user
+        // knows which commit's PR description they are writing.  It is stripped
+        // before saving so it never appears in the GitHub PR body.
+        let context_comment = {
+            let pr_title = message
+                .get(&MessageSection::Title)
+                .map(String::as_str)
+                .unwrap_or("(untitled)");
+            let short_id = &local_commit.short_id;
+
+            // Collect changed files via a git tree diff.
+            let files_text = (|| -> Option<String> {
+                let ct_oid = jj.get_tree_oid_for_commit(local_commit.oid).ok()?;
+                let pt_oid = jj.get_tree_oid_for_commit(local_commit.parent_oid).ok()?;
+                let commit_tree = jj.git_repo.find_tree(ct_oid).ok()?;
+                let parent_tree = jj.git_repo.find_tree(pt_oid).ok()?;
+                let diff = jj
+                    .git_repo
+                    .diff_tree_to_tree(Some(&parent_tree), Some(&commit_tree), None)
+                    .ok()?;
+                let mut lines: Vec<String> = Vec::new();
+                let _ = diff.foreach(
+                    &mut |delta, _| {
+                        let status = match delta.status() {
+                            git2::Delta::Added => "A",
+                            git2::Delta::Deleted => "D",
+                            git2::Delta::Renamed => "R",
+                            git2::Delta::Copied => "C",
+                            _ => "M",
+                        };
+                        let path = delta
+                            .new_file()
+                            .path()
+                            .or_else(|| delta.old_file().path())
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        lines.push(format!("  {status}  {path}"));
+                        true
+                    },
+                    None,
+                    None,
+                    None,
+                );
+                if lines.is_empty() {
+                    Some("  (no files changed)".to_string())
+                } else {
+                    Some(lines.join("\n"))
+                }
+            })()
+            .unwrap_or_else(|| "  (unavailable)".to_string());
+
+            format!(
+                "<!-- spr: writing PR body for: {pr_title} ({short_id})\n\
+                 \n\
+                 Changed files:\n\
+                 {files_text}\n\
+                 \n\
+                 Everything below this line is saved as the PR description.\n\
+                 This comment will not appear in the PR on GitHub.\n\
+                 -->\n"
+            )
+        };
+
+        let body_content = template_content
+            .or_else(|| message.get(&MessageSection::Summary).cloned())
+            .unwrap_or_default();
+        let initial = format!("{context_comment}\n{body_content}");
+
+        let edited = tokio::task::spawn_blocking(move || {
+            dialoguer::Editor::new().extension(".md").edit(&initial)
+        })
+        .await??;
+
+        if let Some(body) = edited {
+            // Strip the context comment we prepended before saving.
+            let body = strip_context_comment(body.trim()).trim().to_string();
+            if !body.is_empty() {
+                message.insert(MessageSection::Summary, body);
+                local_commit.message_changed = true;
+            }
+        }
+    }
+
     // Get the name of the existing Pull Request branch, or constuct one if
     // there is none yet.
 
@@ -326,6 +554,11 @@ async fn diff_impl(
                 pr_base_tree,
                 pr_master_base,
             )
+        } else if let Some((_, prev_oid)) = prev_pr_info.as_ref() {
+            // New PR in a stack: initialise from the previous PR's pushed commit so
+            // Case 1 applies (trees already match) and the correct parent is used.
+            let prev_tree = jj.get_tree_oid_for_commit(*prev_oid)?;
+            (*prev_oid, prev_tree, *prev_oid, prev_tree, master_base_oid)
         } else {
             let master_base_tree = jj.get_tree_oid_for_commit(master_base_oid)?;
             (
@@ -347,22 +580,31 @@ async fn diff_impl(
             // Request branch and base are all the right ones.
             output("✅", "No update necessary")?;
 
+            let mut pull_request_updates: PullRequestUpdate = Default::default();
+
             if opts.update_message {
                 // However, the user requested to update the commit message on
                 // GitHub
-
-                let mut pull_request_updates: PullRequestUpdate = Default::default();
                 pull_request_updates.update_message(pull_request, message);
+            }
 
-                if !pull_request_updates.is_empty() {
-                    // ...and there are actual changes to the message
-                    gh.update_pull_request(pull_request.number, pull_request_updates)
-                        .await?;
+            // Even when content is unchanged, the GitHub base may need updating
+            // to point at the previous PR's branch (stacked PRs).
+            if let Some((ref prev_branch, _)) = prev_pr_info
+                && pull_request.base.branch_name() != prev_branch.branch_name()
+            {
+                pull_request_updates.base = Some(prev_branch.branch_name().to_string());
+            }
+
+            if !pull_request_updates.is_empty() {
+                gh.update_pull_request(pull_request.number, pull_request_updates)
+                    .await?;
+                if opts.update_message {
                     output("✍", "Updated commit message on GitHub")?;
                 }
             }
 
-            return Ok(());
+            return Ok((pull_request_branch, pr_head_oid, pull_request.number));
         }
     }
 
@@ -469,69 +711,152 @@ async fn diff_impl(
         (Some(new_base_branch_commit), Some(base_branch))
     };
 
+    // In a stacked PR workflow, override the base branch to be the previous
+    // PR's branch. We don't push anything to that branch (it was already
+    // updated by the previous diff_impl call), so pr_base_parent is cleared.
+    let (base_branch, pr_base_parent) = if let Some((prev_branch, _)) = prev_pr_info.as_ref() {
+        (Some(prev_branch.clone()), None)
+    } else {
+        (base_branch, pr_base_parent)
+    };
+
     let mut github_commit_message = opts.message.clone();
-    if pull_request.is_some() && github_commit_message.is_none() {
-        let input = {
-            let message_on_prompt = message_on_prompt.clone();
 
-            tokio::task::spawn_blocking(move || {
-                dialoguer::Input::<String>::new()
-                    .with_prompt("Message (leave empty to abort)")
-                    .with_initial_text(message_on_prompt)
-                    .allow_empty(true)
-                    .interact_text()
-            })
-            .await??
-        };
+    // In rebase mode there is no merge commit, so skip the bookkeeping-message
+    // logic entirely. github_commit_message stays None (uses the PR title).
+    let is_rebase_stack =
+        config.stack_strategy == StackStrategy::Rebase && prev_pr_info.is_some();
 
-        if input.is_empty() {
-            return Err(Error::new("Aborted as per user request".to_string()));
+    if pull_request.is_some() && github_commit_message.is_none() && !is_rebase_stack {
+        // If the resulting commit will have multiple parents (a merge commit),
+        // generate the message automatically rather than prompting. The message
+        // follows Git's conventional "Merge branch X into Y" format so it is
+        // clear what the two parents represent.
+        //
+        // After the stacking override above, pr_base_parent is None for stacked
+        // PRs; the second parent (prev_oid) will be added by the fix below.
+        let will_be_merge_commit = pr_base_parent.map_or_else(|| false, |oid| oid != pr_head_oid)
+            || prev_pr_info
+                .as_ref()
+                .is_some_and(|(_, prev_oid)| *prev_oid != pr_head_oid);
+
+        // Only auto-generate when the PR's own delta hasn't changed — i.e. the
+        // commit is purely a bookkeeping merge to update the parent chain.
+        //
+        // We compare deltas (not absolute trees) because when a parent PR is
+        // amended, the absolute tree of every child PR changes even though the
+        // child's own contribution is unchanged. `has_unchanged_delta` applies
+        // the old delta on top of the new base and checks the result matches.
+        let delta_unchanged =
+            jj.has_unchanged_delta(pr_base_tree, new_base_tree, pr_head_tree, new_head_tree);
+
+        if will_be_merge_commit && delta_unchanged {
+            // Describe the "from" branch: previous PR's branch for stacks,
+            // the existing base branch for Case 3, or master for Case 2.
+            let from_branch = if let Some((prev_branch, _)) = prev_pr_info.as_ref() {
+                prev_branch.branch_name().to_string()
+            } else if let Some(ref bb) = base_branch {
+                bb.branch_name().to_string()
+            } else {
+                config.master_ref.branch_name().to_string()
+            };
+            github_commit_message = Some(format!(
+                "Merge branch '{}' into '{}'\n\n[skip ci]",
+                from_branch,
+                pull_request_branch.branch_name(),
+            ));
+        } else {
+            let input = {
+                let message_on_prompt = message_on_prompt.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    dialoguer::Input::<String>::new()
+                        .with_prompt("Message (leave empty to abort)")
+                        .with_initial_text(message_on_prompt)
+                        .allow_empty(true)
+                        .interact_text()
+                })
+                .await??
+            };
+
+            if input.is_empty() {
+                return Err(Error::new("Aborted as per user request".to_string()));
+            }
+
+            *message_on_prompt = input.clone();
+            github_commit_message = Some(input);
         }
-
-        *message_on_prompt = input.clone();
-        github_commit_message = Some(input);
     }
 
-    // Construct the new commit for the Pull Request branch. First parent is the
-    // current head commit of the Pull Request (we set this to the master base
-    // commit earlier if the Pull Request does not yet exist)
-    let mut pr_commit_parents = vec![pr_head_oid];
+    // Construct the new commit for the Pull Request branch.
+    //
+    // In rebase mode, when this PR is in a stack, the only parent is the
+    // previous PR's head commit. This produces a linear (non-merge) commit.
+    //
+    // In merge mode (the default), the first parent is the current PR head
+    // commit, followed by any bookkeeping parents needed for rebases.
+    let pr_commit_parents: Vec<Oid> = if is_rebase_stack {
+        let (_, prev_oid) = prev_pr_info.as_ref().unwrap();
+        vec![*prev_oid]
+    } else {
+        // First parent is the current head commit of the Pull Request (set to
+        // the master base commit earlier if the Pull Request does not yet exist)
+        let mut parents = vec![pr_head_oid];
 
-    // If we prepared a commit earlier that needs merging into the Pull Request
-    // branch, then that commit is a parent of the new Pull Request commit.
-    if let Some(oid) = pr_base_parent {
-        // ...unless if that's the same commit as the one we added to
-        // pr_commit_parents first.
-        if pr_commit_parents.first() != Some(&oid) {
-            pr_commit_parents.push(oid);
+        // If we prepared a commit earlier that needs merging into the Pull
+        // Request branch, then that commit is a parent of the new PR commit.
+        if let Some(oid) = pr_base_parent {
+            // ...unless if that's the same commit as the one we added first.
+            if parents.first() != Some(&oid) {
+                parents.push(oid);
+            }
         }
-    }
+
+        // For stacked PRs, ensure the previous PR's head is a parent so GitHub
+        // can compute the correct merge base for the diff.
+        if let Some((_, prev_oid)) = prev_pr_info.as_ref()
+            && !parents.contains(prev_oid)
+        {
+            parents.push(*prev_oid);
+        }
+
+        parents
+    };
 
     // Create the new commit
+    let commit_title = message
+        .get(&MessageSection::Title)
+        .map(String::as_str)
+        .unwrap_or("Initial change");
     let pr_commit = jj.create_derived_commit(
         local_commit.oid,
         &format!(
             "{}\n\nCreated using jj-spr {}",
-            github_commit_message
-                .as_ref()
-                .map(|s| &s[..])
-                .unwrap_or("[jj-spr] initial version"),
+            github_commit_message.as_deref().unwrap_or(commit_title),
             env!("CARGO_PKG_VERSION"),
         ),
         new_head_tree,
         &pr_commit_parents[..],
     )?;
 
+    // In rebase-stack mode, the rewritten commit is not a fast-forward of the
+    // existing PR branch tip, so we need --force-with-lease.
+    let force_push = is_rebase_stack && pull_request.is_some();
+
     let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("push")
-        .arg("--atomic")
-        .arg("--no-verify")
-        .arg("--")
+    cmd.arg("push").arg("--atomic").arg("--no-verify");
+    if force_push {
+        cmd.arg("--force-with-lease");
+    }
+    cmd.arg("--")
         .arg(&config.remote_name)
         .arg(format!("{}:{}", pr_commit, pull_request_branch.on_github()));
 
+    let final_pr_number: u64;
+
     if let Some(pull_request) = pull_request {
         // We are updating an existing Pull Request
+        final_pr_number = pull_request.number;
 
         if needs_merging_master {
             output(
@@ -623,6 +948,7 @@ async fn diff_impl(
                 opts.draft,
             )
             .await?;
+        final_pr_number = pull_request_number;
 
         let pull_request_url = config.pull_request_url(pull_request_number);
 
@@ -651,7 +977,7 @@ async fn diff_impl(
         }
     }
 
-    Ok(())
+    Ok((pull_request_branch, pr_commit, final_pr_number))
 }
 
 #[cfg(test)]
@@ -668,6 +994,7 @@ mod tests {
             "main".into(),
             "spr/test/".into(),
             false,
+            crate::config::StackStrategy::Merge,
         )
     }
 
@@ -747,6 +1074,7 @@ mod tests {
             cherry_pick: false,
             base: None,
             revision: None,
+            no_edit: true,
         };
 
         assert!(!opts.all);
@@ -767,6 +1095,7 @@ mod tests {
             cherry_pick: false,
             base: Some("main".to_string()),
             revision: None,
+            no_edit: true,
         };
 
         assert_eq!(opts.base, Some("main".to_string()));
@@ -792,6 +1121,7 @@ mod tests {
             cherry_pick: false,
             base: Some("main".to_string()),
             revision: None,
+            no_edit: true,
         };
 
         assert_eq!(opts_with_base.base.as_deref(), Some("main"));
@@ -805,6 +1135,7 @@ mod tests {
             cherry_pick: false,
             base: Some("trunk()".to_string()),
             revision: None,
+            no_edit: true,
         };
 
         assert_eq!(opts_with_trunk.base.as_deref(), Some("trunk()"));
@@ -820,6 +1151,7 @@ mod tests {
             cherry_pick: false,
             base: Some("trunk()".to_string()),
             revision: None,
+            no_edit: true,
         };
 
         // When --all is specified, it should work with base revisions
@@ -838,6 +1170,7 @@ mod tests {
             cherry_pick: false,
             base: Some("trunk()".to_string()),
             revision: None,
+            no_edit: true,
         };
 
         assert!(opts.all);

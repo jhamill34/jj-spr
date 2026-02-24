@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::{
     error::{Error, Result, ResultExt},
-    message::{MessageSection, MessageSectionsMap, build_github_body, parse_message},
+    message::{MessageSection, MessageSectionsMap, build_github_body},
 };
 use std::collections::{HashMap, HashSet};
 
@@ -43,6 +43,67 @@ pub enum ReviewStatus {
     Rejected,
 }
 
+/// Normalise GitHub's \r\n line endings to \n and strip trailing whitespace
+/// from each line, so comparisons don't false-positive on GitHub's formatting.
+fn normalize_line_endings(s: &str) -> String {
+    s.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const STACK_NAV_START: &str = "<!-- spr-stack-nav -->";
+const STACK_NAV_END: &str = "<!-- /spr-stack-nav -->";
+
+/// Strip the `<!-- spr-stack-nav --> ... <!-- /spr-stack-nav -->` block from a
+/// PR body, returning the remaining content with surrounding whitespace trimmed.
+pub fn strip_stack_nav(body: &str) -> String {
+    if let (Some(start), Some(end_pos)) = (body.find(STACK_NAV_START), body.rfind(STACK_NAV_END)) {
+        let end = end_pos + STACK_NAV_END.len();
+        let before = body[..start].trim_end();
+        let after = body[end..].trim_start();
+        if before.is_empty() {
+            after.to_string()
+        } else if after.is_empty() {
+            before.to_string()
+        } else {
+            format!("{before}\n\n{after}")
+        }
+    } else {
+        body.to_string()
+    }
+}
+
+/// Build the stack navigation block to append to a PR body.
+///
+/// `prs` is a slice of `(number, title)` for every PR in the stack (in order).
+/// `current_pr` is highlighted with a bold arrow.
+pub fn build_stack_nav_block(
+    prs: &[(u64, &str)],
+    current_pr: u64,
+    config: &crate::config::Config,
+) -> String {
+    let items: Vec<String> = prs
+        .iter()
+        .map(|(number, title)| {
+            let url = config.pull_request_url(*number);
+            if *number == current_pr {
+                format!("- **→ #{number} [{title}]({url})**")
+            } else {
+                format!("- #{number} [{title}]({url})")
+            }
+        })
+        .collect();
+    format!(
+        "{}\n\n---\n\n**Stack**\n{}\n\n{}",
+        STACK_NAV_START,
+        items.join("\n"),
+        STACK_NAV_END,
+    )
+}
+
 #[derive(serde::Serialize, Default, Debug)]
 pub struct PullRequestUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,14 +122,28 @@ impl PullRequestUpdate {
     }
 
     pub fn update_message(&mut self, pull_request: &PullRequest, message: &MessageSectionsMap) {
-        let title = message.get(&MessageSection::Title);
-        if title.is_some() && title != Some(&pull_request.title) {
-            self.title = title.cloned();
+        // Normalize both sides before comparing. GitHub returns \r\n line endings
+        // and may have trailing whitespace; local content uses \n throughout.
+        if let Some(local_title) = message.get(&MessageSection::Title)
+            && normalize_line_endings(local_title).trim()
+                != normalize_line_endings(&pull_request.title).trim()
+        {
+            self.title = Some(local_title.clone());
         }
 
         let body = build_github_body(message);
-        if pull_request.body.as_ref() != Some(&body) {
-            self.body = Some(body);
+        // Strip any stack-nav block from both sides before comparing.
+        // The local Summary may have nav embedded if `spr amend` was run
+        // against a PR whose body already had nav appended; and GitHub's body
+        // always has nav appended by the second-pass loop.  Stripping both
+        // ensures neither side carries spurious nav during the comparison, and
+        // the stored value is the clean, nav-free body so the second-pass loop
+        // can append a fresh nav block afterwards.
+        let body_clean = strip_stack_nav(body.trim());
+        let pr_body_raw = pull_request.body.as_deref().unwrap_or("");
+        let pr_body_clean = strip_stack_nav(pr_body_raw.trim());
+        if normalize_line_endings(body_clean.trim()) != normalize_line_endings(pr_body_clean.trim()) {
+            self.body = Some(body_clean);
         }
     }
 }
@@ -225,7 +300,12 @@ impl GitHub {
             git2::Oid::zero()
         };
 
-        let mut sections = parse_message(&pr.body, MessageSection::Summary);
+        let mut sections = MessageSectionsMap::new();
+        let body = normalize_line_endings(&pr.body);
+        let body = body.trim();
+        if !body.is_empty() {
+            sections.insert(MessageSection::Summary, body.to_string());
+        }
 
         let title = pr.title.trim().to_string();
         sections.insert(
@@ -367,6 +447,25 @@ impl GitHub {
             .number;
 
         Ok(number)
+    }
+
+    /// Returns the numbers of all open PRs whose base branch is `base_branch`.
+    pub async fn get_open_prs_with_base(&self, base_branch: &str) -> Result<Vec<u64>> {
+        #[derive(Deserialize)]
+        struct MinimalPr {
+            number: u64,
+        }
+        let prs: Vec<MinimalPr> = octocrab::instance()
+            .get(
+                format!("/repos/{}/{}/pulls", self.config.owner, self.config.repo),
+                Some(&[
+                    ("state", "open"),
+                    ("base", base_branch),
+                    ("per_page", "100"),
+                ]),
+            )
+            .await?;
+        Ok(prs.into_iter().map(|p| p.number).collect())
     }
 
     pub async fn update_pull_request(&self, number: u64, updates: PullRequestUpdate) -> Result<()> {
@@ -603,5 +702,71 @@ mod tests {
         assert_eq!(r.local(), "refs/remotes/github-remote/refs/heads/foo");
         assert_eq!(r.branch_name(), "refs/heads/foo");
         assert!(!r.is_master_branch());
+    }
+
+    fn make_config() -> crate::config::Config {
+        crate::config::Config::new(
+            "owner".into(),
+            "repo".into(),
+            "origin".into(),
+            "main".into(),
+            "spr/".into(),
+            false,
+            crate::config::StackStrategy::Merge,
+        )
+    }
+
+    #[test]
+    fn test_strip_stack_nav_no_nav() {
+        assert_eq!(strip_stack_nav("some body"), "some body");
+        assert_eq!(strip_stack_nav(""), "");
+    }
+
+    #[test]
+    fn test_strip_stack_nav_only_nav() {
+        let body =
+            format!("{}\n\n---\n\n**Stack**\n- item\n\n{}", STACK_NAV_START, STACK_NAV_END);
+        assert_eq!(strip_stack_nav(&body), "");
+    }
+
+    #[test]
+    fn test_strip_stack_nav_with_prefix() {
+        let body = format!(
+            "My description\n\n{}\n\n---\n\n**Stack**\n- item\n\n{}",
+            STACK_NAV_START, STACK_NAV_END
+        );
+        assert_eq!(strip_stack_nav(&body), "My description");
+    }
+
+    #[test]
+    fn test_strip_stack_nav_with_suffix() {
+        let body = format!(
+            "{}\n\n---\n\n**Stack**\n- item\n\n{}\n\nafter",
+            STACK_NAV_START, STACK_NAV_END
+        );
+        assert_eq!(strip_stack_nav(&body), "after");
+    }
+
+    #[test]
+    fn test_strip_stack_nav_idempotent() {
+        let config = make_config();
+        let prs = &[(1u64, "First PR"), (2u64, "Second PR")];
+        let nav = build_stack_nav_block(prs, 1, &config);
+        // Stripping twice returns the same result as stripping once
+        assert_eq!(strip_stack_nav(&nav), strip_stack_nav(&strip_stack_nav(&nav)));
+    }
+
+    #[test]
+    fn test_build_stack_nav_block_highlights_current() {
+        let config = make_config();
+        let prs = &[(1u64, "First"), (2u64, "Second"), (3u64, "Third")];
+        let block = build_stack_nav_block(prs, 2, &config);
+        assert!(block.contains(STACK_NAV_START));
+        assert!(block.contains(STACK_NAV_END));
+        assert!(block.contains("**→ #2"));
+        assert!(!block.contains("**→ #1"));
+        assert!(!block.contains("**→ #3"));
+        assert!(block.contains("- #1 [First]"));
+        assert!(block.contains("- #3 [Third]"));
     }
 }

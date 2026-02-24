@@ -109,6 +109,22 @@ async fn close_impl(
 
     let base_is_master = pull_request.base.is_master_branch();
 
+    // Determine whether the base branch is a spr "helper" base branch that
+    // was created to represent intermediate commits (named
+    // `<prefix><master>.<slug>`).  In a stacked-PR workflow the base of a
+    // non-bottom PR is the *head branch of the previous PR*, not a helper
+    // base branch.  Deleting a previous PR's head branch would cause GitHub
+    // to automatically close that PR, which is not what the user wants.
+    let is_spr_base_branch = pull_request
+        .base
+        .branch_name()
+        .strip_prefix(&config.branch_prefix)
+        .map(|after_prefix| {
+            after_prefix
+                .starts_with(&format!("{}.", config.master_ref.branch_name()))
+        })
+        .unwrap_or(false);
+
     let result = gh
         .update_pull_request(
             pull_request_number,
@@ -146,7 +162,10 @@ async fn close_impl(
         .stderr(Stdio::null())
         .spawn()?;
 
-    let remove_old_base_branch_child_process = if base_is_master {
+    // Only delete the base branch if it is a spr helper base branch.
+    // If the base is another PR's head branch (stacked PRs), skip deletion
+    // so that parent PR is not inadvertently closed.
+    let remove_old_base_branch_child_process = if base_is_master || !is_spr_base_branch {
         None
     } else {
         Some(

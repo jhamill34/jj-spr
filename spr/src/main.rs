@@ -143,6 +143,11 @@ pub async fn spr() -> Result<()> {
     let branch_prefix = get_config_value("spr.branchPrefix", &git_config)
         .ok_or_else(|| Error::new("spr.branchPrefix must be configured".to_string()))?;
     let require_approval = get_config_bool("spr.requireApproval", &git_config).unwrap_or(false);
+    let stack_strategy =
+        match get_config_value("spr.stackStrategy", &git_config).as_deref().unwrap_or("merge") {
+            "rebase" => jj_spr::config::StackStrategy::Rebase,
+            _ => jj_spr::config::StackStrategy::Merge,
+        };
 
     let config = jj_spr::config::Config::new(
         github_owner,
@@ -151,6 +156,7 @@ pub async fn spr() -> Result<()> {
         github_master_branch,
         branch_prefix,
         require_approval,
+        stack_strategy,
     );
 
     let jj = jj_spr::jj::Jujutsu::new(repo)
