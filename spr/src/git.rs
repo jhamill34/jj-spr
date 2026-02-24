@@ -928,6 +928,7 @@ mod tests {
             "main".into(),
             "spr/test/".into(),
             false,
+            crate::config::StackStrategy::Merge,
         )
     }
 
@@ -1073,7 +1074,7 @@ mod tests {
 
         // Create a test commit with SPR metadata before moving repo
         let commit_message =
-            "Test commit\n\nPull Request: https://github.com/test_owner/test_repo/pull/123";
+            "Test commit\n\nPull-Request: https://github.com/test_owner/test_repo/pull/123";
         let commit_oid = create_test_commit(&repo, commit_message, "test content");
 
         let git = Git::new(repo).expect("Failed to create Git instance");

@@ -249,6 +249,29 @@ pub async fn land(
 
     output("🛬", "Landed!")?;
 
+    // Before deleting PR-1's branch, retarget any PRs that use it as their
+    // base (e.g. PR-2 in a stack) to point at main. GitHub would otherwise
+    // close those PRs automatically when their base branch is deleted.
+    // Retarget any PRs stacked on top of the one we just landed. They should
+    // now point at the landed PR's original base (e.g. spr/pr1-branch when
+    // landing PR-2, or main when landing PR-1). Using the original base (not
+    // always main) preserves the rest of the stack correctly.
+    let prs_to_retarget = gh
+        .get_open_prs_with_base(pull_request.head.branch_name())
+        .await
+        .unwrap_or_default();
+    for pr_number in prs_to_retarget {
+        let _ = gh
+            .update_pull_request(
+                pr_number,
+                PullRequestUpdate {
+                    base: Some(config.master_ref.branch_name().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+    }
+
     let mut remove_old_branch_child_process = tokio::process::Command::new("git")
         .arg("push")
         .arg("--no-verify")

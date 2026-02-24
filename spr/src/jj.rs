@@ -215,6 +215,42 @@ impl Jujutsu {
         Ok(index.write_tree_to(&self.git_repo)?)
     }
 
+    /// Returns true if the delta contributed by a PR (old_base→old_head) is
+    /// identical when rebased onto new_base (i.e. the result equals new_head).
+    ///
+    /// This detects the case where a PR's *own* changes are unchanged but its
+    /// absolute tree differs because a parent PR was amended underneath it.
+    pub fn has_unchanged_delta(
+        &self,
+        old_base_tree: Oid,
+        new_base_tree: Oid,
+        old_head_tree: Oid,
+        new_head_tree: Oid,
+    ) -> bool {
+        let Ok(old_base) = self.git_repo.find_tree(old_base_tree) else {
+            return false;
+        };
+        let Ok(new_base) = self.git_repo.find_tree(new_base_tree) else {
+            return false;
+        };
+        let Ok(old_head) = self.git_repo.find_tree(old_head_tree) else {
+            return false;
+        };
+        let Ok(mut index) =
+            self.git_repo
+                .merge_trees(&old_base, &new_base, &old_head, None)
+        else {
+            return false;
+        };
+        if index.has_conflicts() {
+            return false;
+        }
+        index
+            .write_tree_to(&self.git_repo)
+            .map(|rebased| rebased == new_head_tree)
+            .unwrap_or(false)
+    }
+
     pub fn rewrite_commit_messages(&self, commits: &mut [PreparedCommit]) -> Result<()> {
         if commits.is_empty() {
             return Ok(());
@@ -301,7 +337,88 @@ impl Jujutsu {
         })
     }
 
-    fn get_change_id_for_commit(&self, commit_oid: Oid) -> Result<String> {
+    pub fn repo_path(&self) -> &std::path::Path {
+        &self.repo_path
+    }
+
+    /// Walk back through parent(0) from `start_oid` and return the OID of the
+    /// first commit whose message contains the jj-spr footer. Returns `None`
+    /// if no such commit is found within the branch history.
+    pub fn find_last_spr_commit(&self, start_oid: Oid) -> Option<Oid> {
+        let mut current = start_oid;
+        loop {
+            let commit = self.git_repo.find_commit(current).ok()?;
+            if commit.message().unwrap_or("").contains("Created using jj-spr") {
+                return Some(current);
+            }
+            if commit.parent_count() == 0 {
+                return None;
+            }
+            current = commit.parent(0).ok()?.id();
+        }
+    }
+
+    /// Return the paths of files that differ between the tree of `spr_oid`
+    /// (the last commit pushed by jj-spr) and `remote_head_oid` (the current
+    /// remote head, which may include action-added commits on top).
+    pub fn get_action_changed_files(
+        &self,
+        spr_oid: Oid,
+        remote_head_oid: Oid,
+    ) -> Result<Vec<String>> {
+        let spr_tree = self.git_repo.find_commit(spr_oid)?.tree()?;
+        let remote_tree = self.git_repo.find_commit(remote_head_oid)?.tree()?;
+        let diff =
+            self.git_repo
+                .diff_tree_to_tree(Some(&spr_tree), Some(&remote_tree), None)?;
+        let mut paths = Vec::new();
+        for delta in diff.deltas() {
+            for file in [delta.old_file(), delta.new_file()] {
+                if let Some(p) = file.path() {
+                    let s = p.to_string_lossy().into_owned();
+                    if !paths.contains(&s) {
+                        paths.push(s);
+                    }
+                }
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Apply remote file changes into a local JJ change by running
+    /// `jj restore --from <remote_sha> <paths…> --to <change_id>`.
+    pub fn restore_from_remote(
+        &self,
+        remote_sha: &str,
+        file_paths: &[String],
+        change_id: &str,
+    ) -> Result<()> {
+        let mut args = vec![
+            "restore".to_string(),
+            "--from".to_string(),
+            remote_sha.to_string(),
+            "--to".to_string(),
+            change_id.to_string(),
+        ];
+        for p in file_paths {
+            args.push(p.clone());
+        }
+        let mut cmd = Command::new(&self.jj_bin);
+        cmd.args(&args)
+            .current_dir(&self.repo_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = cmd.output()?;
+        if !out.status.success() {
+            return Err(Error::new(format!(
+                "jj restore failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn get_change_id_for_commit(&self, commit_oid: Oid) -> Result<String> {
         // Get the change ID for a given commit OID
         let output = self.run_captured_with_args([
             "log",
@@ -365,6 +482,7 @@ mod tests {
             "main".into(),
             "spr/test/".into(),
             false,
+            crate::config::StackStrategy::Merge,
         )
     }
 

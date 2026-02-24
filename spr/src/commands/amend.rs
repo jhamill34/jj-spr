@@ -11,6 +11,7 @@ use crate::{
     message::validate_commit_message,
     output::{output, write_commit_title},
 };
+use git2::Oid;
 
 #[derive(Debug, clap::Parser)]
 pub struct AmendOptions {
@@ -26,6 +27,12 @@ pub struct AmendOptions {
     /// If a range is provided, behaves like --all mode. If not specified, uses '@-'.
     #[clap(short = 'r', long)]
     revision: Option<String>,
+
+    /// Sync code changes pushed to the PR branch by external tooling (e.g. a
+    /// GitHub Action) back into the local JJ change, in addition to syncing
+    /// the commit message.
+    #[clap(long)]
+    sync: bool,
 }
 
 pub async fn amend(
@@ -70,7 +77,22 @@ pub async fn amend(
         write_commit_title(commit)?;
         if let Some(pull_request) = pull_request {
             let pull_request = pull_request.await??;
+
+            if opts.sync {
+                sync_code_from_pr(jj, commit.oid, pull_request.head_oid)?;
+            }
+
             commit.message = pull_request.sections;
+            // Strip any stack navigation block that was appended to the PR
+            // body on GitHub — it should not be stored in the local commit
+            // message's Summary section.
+            if let Some(summary) =
+                commit.message.get_mut(&crate::message::MessageSection::Summary)
+            {
+                let cleaned =
+                    crate::github::strip_stack_nav(summary.trim()).trim().to_string();
+                *summary = cleaned;
+            }
             commit.message_changed = true;
         }
         failure = validate_commit_message(&commit.message).is_err() || failure;
@@ -78,4 +100,44 @@ pub async fn amend(
     jj.rewrite_commit_messages(&mut pc)?;
 
     if failure { Err(Error::empty()) } else { Ok(()) }
+}
+
+fn sync_code_from_pr(
+    jj: &crate::jj::Jujutsu,
+    local_commit_oid: Oid,
+    remote_head_oid: Oid,
+) -> Result<()> {
+    // Walk back from the remote head to find the last commit pushed by
+    // jj-spr. Commits added on top of it by external tooling (GitHub
+    // Actions, etc.) are the ones we want to absorb.
+    let last_spr_oid = match jj.find_last_spr_commit(remote_head_oid) {
+        Some(oid) => oid,
+        None => {
+            output("⚠️", "Could not find a jj-spr commit on the remote branch — skipping code sync")?;
+            return Ok(());
+        }
+    };
+
+    if last_spr_oid == remote_head_oid {
+        output("✅", "No remote code changes to sync")?;
+        return Ok(());
+    }
+
+    let changed_files = jj.get_action_changed_files(last_spr_oid, remote_head_oid)?;
+    if changed_files.is_empty() {
+        output("✅", "No remote code changes to sync")?;
+        return Ok(());
+    }
+
+    let change_id = jj.get_change_id_for_commit(local_commit_oid)?;
+    jj.restore_from_remote(&remote_head_oid.to_string(), &changed_files, &change_id)?;
+
+    output(
+        "🔄",
+        &format!(
+            "Synced {} file(s) from remote PR branch into local change",
+            changed_files.len()
+        ),
+    )?;
+    Ok(())
 }

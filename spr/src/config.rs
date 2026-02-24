@@ -9,6 +9,12 @@ use std::collections::HashSet;
 
 use crate::{error::Result, github::GitHubBranch, utils::slugify};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StackStrategy {
+    Merge,
+    Rebase,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub owner: String,
@@ -17,6 +23,7 @@ pub struct Config {
     pub master_ref: GitHubBranch,
     pub branch_prefix: String,
     pub require_approval: bool,
+    pub stack_strategy: StackStrategy,
 }
 
 impl Config {
@@ -27,6 +34,7 @@ impl Config {
         master_branch: String,
         branch_prefix: String,
         require_approval: bool,
+        stack_strategy: StackStrategy,
     ) -> Self {
         let master_ref =
             GitHubBranch::new_from_branch_name(&master_branch, &remote_name, &master_branch);
@@ -37,6 +45,7 @@ impl Config {
             master_ref,
             branch_prefix,
             require_approval,
+            stack_strategy,
         }
     }
 
@@ -229,6 +238,7 @@ mod tests {
             "master".into(),
             "spr/foo/".into(),
             false,
+            crate::config::StackStrategy::Merge,
         )
     }
 
