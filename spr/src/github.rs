@@ -194,6 +194,29 @@ type GitObjectID = String;
 )]
 pub struct PullRequestMergeabilityQuery;
 
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/pullrequest_ci_status_query.graphql",
+    response_derives = "Debug"
+)]
+pub struct PullRequestCIStatusQuery;
+
+/// The combined CI/check status for a pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CIStatus {
+    /// All checks passed.
+    Success,
+    /// One or more checks failed.
+    Failure,
+    /// One or more checks errored.
+    Error,
+    /// Checks are still running or queued.
+    Pending,
+    /// No checks are configured for this PR.
+    Unknown,
+}
+
 impl GitHub {
     pub fn new(config: crate::config::Config, graphql_client: reqwest::Client) -> Self {
         Self {
@@ -500,6 +523,53 @@ impl GitHub {
             .await?;
 
         Ok(())
+    }
+
+    /// Fetch the combined CI/check status for a pull request.
+    pub async fn get_pr_ci_status(&self, number: u64) -> Result<CIStatus> {
+        let variables = pull_request_ci_status_query::Variables {
+            name: self.config.repo.clone(),
+            owner: self.config.owner.clone(),
+            number: number as i64,
+        };
+        let request_body = PullRequestCIStatusQuery::build_query(variables);
+        let res = self
+            .graphql_client
+            .post("https://api.github.com/graphql")
+            .json(&request_body)
+            .send()
+            .await?;
+        let response_body: Response<pull_request_ci_status_query::ResponseData> =
+            res.json().await?;
+
+        if let Some(errors) = response_body.errors {
+            let error = Err(Error::new(format!(
+                "querying PR #{number} CI status failed"
+            )));
+            return errors
+                .into_iter()
+                .fold(error, |err, e| err.context(e.to_string()));
+        }
+
+        let pr = response_body
+            .data
+            .ok_or_else(|| Error::new("failed to fetch PR"))?
+            .repository
+            .ok_or_else(|| Error::new("failed to find repository"))?
+            .pull_request
+            .ok_or_else(|| Error::new("failed to find PR"))?;
+
+        Ok(match pr.status_check_rollup {
+            None => CIStatus::Unknown,
+            Some(rollup) => match rollup.state {
+                pull_request_ci_status_query::StatusState::SUCCESS => CIStatus::Success,
+                pull_request_ci_status_query::StatusState::FAILURE => CIStatus::Failure,
+                pull_request_ci_status_query::StatusState::ERROR => CIStatus::Error,
+                pull_request_ci_status_query::StatusState::PENDING
+                | pull_request_ci_status_query::StatusState::EXPECTED => CIStatus::Pending,
+                _ => CIStatus::Unknown,
+            },
+        })
     }
 
     pub async fn get_pull_request_mergeability(

@@ -72,6 +72,9 @@ enum Commands {
 
     /// Close a Pull request
     Close(commands::close::CloseOptions),
+
+    /// Download GitHub Actions build artifacts for a Pull Request
+    Artifacts(commands::artifacts::ArtifactsOptions),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -202,6 +205,9 @@ pub async fn spr() -> Result<()> {
         Commands::List => commands::list::list(graphql_client, &config).await?,
         Commands::Patch(opts) => commands::patch::patch(opts, &jj, &mut gh, &config).await?,
         Commands::Close(opts) => commands::close::close(opts, &jj, &mut gh, &config).await?,
+        Commands::Artifacts(opts) => {
+            commands::artifacts::artifacts(opts, &jj, &config, &github_auth_token).await?
+        }
         // The following commands are executed above and return from this
         // function before it reaches this match.
         Commands::Init | Commands::Format(_) => (),
