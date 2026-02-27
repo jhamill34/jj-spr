@@ -10,7 +10,7 @@ use std::{io::Write, process::Stdio, time::Duration};
 
 use crate::{
     error::{Error, Result, ResultExt},
-    github::{PullRequestState, PullRequestUpdate, ReviewStatus},
+    github::{CIStatus, PullRequestState, PullRequestUpdate, ReviewStatus},
     message::build_github_body_for_merging,
     output::{output, write_commit_title},
     utils::run_command,
@@ -26,6 +26,10 @@ pub struct LandOptions {
     /// Jujutsu revision to operate on (if not specified, uses '@')
     #[clap(short = 'r', long)]
     revision: Option<String>,
+
+    /// Skip safety checks (PR up to date with main, GitHub Actions passing)
+    #[clap(long)]
+    force: bool,
 }
 
 pub async fn land(
@@ -64,6 +68,32 @@ pub async fn land(
         ));
     }
 
+    // Check that GitHub Actions are passing before attempting to land.
+    if !opts.force {
+        let ci_status = gh.clone().get_pr_ci_status(pull_request_number).await?;
+        match ci_status {
+            CIStatus::Failure => {
+                return Err(Error::new(
+                    "GitHub Actions are failing on this Pull Request. \
+                     Fix the failing checks or use --force to skip this check.",
+                ));
+            }
+            CIStatus::Error => {
+                return Err(Error::new(
+                    "GitHub Actions have errors on this Pull Request. \
+                     Fix the errors or use --force to skip this check.",
+                ));
+            }
+            CIStatus::Pending => {
+                return Err(Error::new(
+                    "GitHub Actions are still running on this Pull Request. \
+                     Wait for them to complete or use --force to skip this check.",
+                ));
+            }
+            CIStatus::Success | CIStatus::Unknown => {}
+        }
+    }
+
     output("🛫", "Getting started...")?;
 
     // Fetch current master from GitHub.
@@ -81,6 +111,38 @@ pub async fn land(
     // TODO: Implement Jujutsu-native cherry-pick and merge validation
     // For now, we'll trust GitHub's merge validation and skip local validation
     let base_is_master = pull_request.base.is_master_branch();
+
+    // Check that the PR head is not behind the main branch.
+    // Only apply this to PRs that directly target the master branch.
+    if !opts.force && base_is_master {
+        let master_tip_output = tokio::process::Command::new("git")
+            .args(["rev-parse", config.master_ref.local()])
+            .output()
+            .await?;
+        if master_tip_output.status.success() {
+            let master_tip =
+                String::from_utf8_lossy(&master_tip_output.stdout).trim().to_string();
+            // `git merge-base --is-ancestor A B` exits 0 if A is an ancestor of B.
+            // We check that the current master tip is an ancestor of the PR head,
+            // meaning the PR has been rebased onto (or merged with) the latest main.
+            let is_ancestor = tokio::process::Command::new("git")
+                .args([
+                    "merge-base",
+                    "--is-ancestor",
+                    &master_tip,
+                    &pull_request.head_oid.to_string(),
+                ])
+                .status()
+                .await?;
+            if !is_ancestor.success() {
+                return Err(Error::new(
+                    "This Pull Request is behind the main branch. Please rebase your \
+                     changes, run `spr diff` to update the Pull Request, and try again. \
+                     Use --force to skip this check.",
+                ));
+            }
+        }
+    }
 
     // Skip local cherry-pick validation for Jujutsu workflow
     // GitHub will validate mergeability during the merge process

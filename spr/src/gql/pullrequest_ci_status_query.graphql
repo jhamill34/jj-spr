@@ -1,0 +1,13 @@
+query PullRequestCIStatusQuery(
+  $name: String!
+  $owner: String!
+  $number: Int!
+) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      statusCheckRollup {
+        state
+      }
+    }
+  }
+}
